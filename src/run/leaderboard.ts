@@ -1,0 +1,692 @@
+import { createHash } from "node:crypto";
+import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { z } from "zod";
+import { BRAND_CSS, MARK_SVG } from "../report/brand.ts";
+import { renderHtml } from "../report/html.ts";
+import type { Domain } from "../spec/schema.ts";
+import { noopAgent } from "../sim/noop.ts";
+import { scriptedUser } from "../sim/scripted.ts";
+import { DEFAULT_AGENT_EFFORT, type Effort, type Provider } from "../sim/claude.ts";
+import type { AgentAdapter, UserSimulator } from "../sim/types.ts";
+import { changedVerdicts, RegradeError, regradeSuite } from "./regrade.ts";
+import { parseJson, parseResults } from "./read.ts";
+import { runSuite, type SuiteResult } from "./suite.ts";
+import { costOf, totalTokens } from "./usage.ts";
+import { writeFileAtomic } from "./write.ts";
+
+/** Whether an agent spec runs the Claude adapter, the only one whose reasoning effort can be set. */
+const isClaude = (spec: string) => spec === "claude" || spec.startsWith("claude:");
+
+/** Why an entry's `effort` can't be used, or undefined when it can. */
+function effortProblem(entry: { agent: string; effort?: Effort }): string | undefined {
+  return entry.effort !== undefined && !isClaude(entry.agent) ? `effort applies only to claude: agents, not ${entry.agent}` : undefined;
+}
+
+/** The models file `sandtable leaderboard -m <file>` reads. */
+export const ModelsFile = z
+  .object({
+    user: z.string().optional(),
+    k: z.number().int().positive().optional(),
+    models: z
+      .array(
+        z
+          .object({ label: z.string(), agent: z.string(), effort: z.enum(["low", "medium", "high", "xhigh", "max"]).optional() })
+          .strict()
+          .superRefine((m, ctx) => {
+            const problem = effortProblem(m);
+            if (problem) ctx.addIssue({ code: "custom", path: ["effort"], message: problem });
+          }),
+      )
+      .min(1),
+  })
+  .strict();
+
+export interface LeaderboardEntry {
+  /** Display name, e.g. "Claude Opus 5.5". */
+  label: string;
+  /** Agent spec as accepted by `sandtable run --agent`, e.g. claude:claude-opus-5-5 or bedrock:global.openai.gpt-5.5. */
+  agent: string;
+  /** Reasoning effort for a `claude:` agent. Default: the Claude agent's own (`medium`). Rejected on any other agent. */
+  effort?: Effort;
+}
+
+export interface LeaderboardRow {
+  label: string;
+  agent: string;
+  /** The reasoning effort a Claude agent ran at; absent for other agents. */
+  effort?: Effort;
+  baseline: boolean;
+  passHat1: number;
+  passHatK: number;
+  tasks: number;
+  trials: number;
+  /** Failed trials per broken invariant. */
+  violations: Record<string, number>;
+  /** Most common failed check across trials. */
+  topFailure?: string;
+  /** Soft invariants: how often each was broken, in the trials where it applied. Never part of the score. */
+  soft: Record<string, { applied: number; broken: number; rate: number | null }>;
+  /** Agent and simulated caller together. */
+  costUsd: number | null;
+  costPerTrialUsd: number | null;
+  /** The agent's model only: what the Cost / trial column shows. */
+  agentCostPerTrialUsd: number | null;
+  agentTurnP95Ms: number | null;
+  agentTokens: number;
+  error?: string;
+}
+
+/** What produced a run, beyond the domain, caller, k and models: recorded in run.json and leaderboard.json. */
+export interface RunInfo {
+  /** sandtable's version, and the git commit it ran from (with `dirty` for uncommitted changes) when it ran from its own clone. */
+  sandtable: { version: string; commit?: string; dirty?: boolean };
+  /** Where Claude ran: anthropic or bedrock. Set when a Claude model ran. */
+  provider?: Provider;
+  /** The AWS region every Bedrock call went to. Set when something ran on Bedrock. */
+  region?: string;
+}
+
+/** Whether any spec runs Claude, and whether any call goes to Bedrock: a bedrock: agent, or Claude on provider bedrock. */
+export function bedrockUse(specs: readonly string[], provider: Provider): { claude: boolean; bedrock: boolean } {
+  const claude = specs.some((s) => s === "claude" || s.startsWith("claude:"));
+  return { claude, bedrock: specs.some((s) => s.startsWith("bedrock:")) || (claude && provider === "bedrock") };
+}
+
+/**
+ * The region for Bedrock calls: `region`, else AWS_REGION or AWS_DEFAULT_REGION, else the region in the AWS
+ * profile's config file, as the AWS SDK reads it. Undefined when none is set.
+ */
+export async function bedrockRegion(region: string | undefined, awsProfile: string | undefined): Promise<string | undefined> {
+  const set = region ?? process.env.AWS_REGION ?? process.env.AWS_DEFAULT_REGION;
+  if (set) return set;
+  try {
+    const { BedrockRuntimeClient } = await import("@aws-sdk/client-bedrock-runtime");
+    return await new BedrockRuntimeClient(awsProfile ? { profile: awsProfile } : {}).config.region();
+  } catch {
+    return undefined;
+  }
+}
+
+/** "0.1.0 (commit 1a2b3c4)": the sandtable that wrote a leaderboard, for its "Generated … with sandtable" line. */
+function builtWith(s: RunInfo["sandtable"] | undefined): string {
+  if (!s) return "";
+  const commit = s.commit ? ` (commit ${s.commit.slice(0, 7)}${s.dirty ? ", with uncommitted changes" : ""})` : "";
+  return ` ${s.version}${commit}`;
+}
+
+export interface LeaderboardResult {
+  version: 1;
+  domain: string;
+  user: string;
+  k: number;
+  generatedAt: string;
+  /** The sandtable that graded and ranked the rows; each model's run.json says what ran its trials. */
+  sandtable?: RunInfo["sandtable"];
+  /** The `--prices` file the costs use, if one was passed. The built-in Claude prices are pinned by the commit. */
+  prices?: PricesFile;
+  rows: LeaderboardRow[];
+}
+
+/** A prices file as a board records it: where it is, and a hash of its bytes. */
+export interface PricesFile {
+  /** Relative to the working directory when the file is inside it, else only its name, so no home path is published. */
+  file: string;
+  sha256: string;
+}
+
+export function pricesFile(file: string, bytes: Uint8Array | string, cwd = process.cwd()): PricesFile {
+  const abs = path.resolve(cwd, file);
+  const rel = path.relative(cwd, abs);
+  const inside = rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+  return { file: (inside ? rel : path.basename(abs)).split(path.sep).join("/"), sha256: createHash("sha256").update(bytes).digest("hex") };
+}
+
+export interface LeaderboardOptions {
+  domain: Domain;
+  entries: LeaderboardEntry[];
+  user: UserSimulator;
+  k: number;
+  outDir: string;
+  /** Builds an entry's agent; `effort` is set only for a claude: entry that sets one. */
+  resolveAgent: (spec: string, effort?: Effort) => Promise<AgentAdapter>;
+  concurrency?: number;
+  /** Run only these tasks, for every model and the baseline. Default: all. */
+  taskIds?: string[];
+  /**
+   * Reuse an entry's results.json when it exists and matches this run (default true). Stored results that don't
+   * match stop the board before anything runs, so they are never replaced; false reruns every model and replaces them.
+   */
+  resume?: boolean;
+  /**
+   * Written to each model's run.json when its trials run (the provider and region only where that model's calls
+   * went, see `userSpec`), and the `sandtable` part to leaderboard.json. Stored results are reused only where
+   * their run.json has the provider and region the model uses now.
+   */
+  runInfo?: RunInfo;
+  /**
+   * The caller's spec as given (claude:…, scripted), so each model records and compares only the provider and region
+   * its calls used. Without it, `runInfo`'s provider and region are recorded and compared for every model.
+   */
+  userSpec?: string;
+  /** The `--prices` file the costs use: recorded in leaderboard.json. */
+  prices?: PricesFile;
+  /** Called once per entry, and for the do-nothing baseline when it fails. `note` says why an entry was skipped, what crashed, or how many verdicts changed when stored results were graded again. */
+  onEntry?: (label: string, status: "cached" | "regraded" | "ran" | "failed" | "skipped", note?: string) => void;
+}
+
+export function slugify(label: string): string {
+  return label.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "model";
+}
+
+async function exists(p: string): Promise<boolean> {
+  return (await stat(p).catch(() => undefined)) !== undefined;
+}
+
+/** What a run covers: results are comparable only under the same domain, k, simulated caller and tasks. */
+type RunScope = { domain: string; k: number; user: string; taskIds: string[] };
+
+/** Why results are of another run than `want` (another domain, k, caller or tasks), or undefined when they are of the same one. */
+function otherRun(r: SuiteResult, want: RunScope): string | undefined {
+  if (r.domain !== want.domain) return `they are for domain ${r.domain}, not ${want.domain}`;
+  if (r.k !== want.k) return `they are for k=${r.k}, not k=${want.k}`;
+  if (r.user !== want.user) return `the caller was ${r.user}, not ${want.user}`;
+  const had = r.tasks.map((t) => t.id).sort();
+  const want_ = [...want.taskIds].sort();
+  if (had.length !== want_.length || had.some((id, i) => id !== want_[i])) return "they cover different tasks";
+  return undefined;
+}
+
+/**
+ * Why stored results cannot stand in for this run, or undefined when they can. Results are
+ * comparable only under the same domain, k, simulated caller and tasks, and a crashed trial
+ * (throttling, expired credentials) is not a result.
+ */
+export function staleReason(r: SuiteResult, want: RunScope): string | undefined {
+  const other = otherRun(r, want);
+  if (other) return other;
+  const crashed = r.tasks.reduce((n, t) => n + t.trials.filter((tr) => tr.endReason === "error").length, 0);
+  if (crashed) return `${crashed} trial(s) crashed`;
+  return undefined;
+}
+
+/**
+ * What defines a model's stored results beyond what results.json records: the agent spec from the
+ * models file (results.json has only the adapter's name, and `claude` names a default model), and a
+ * Claude agent's reasoning effort. Written next to results.json as run.json.
+ */
+interface RunKey {
+  agent: string;
+  /** The effort a Claude agent ran at; absent for other agents. */
+  effort?: Effort;
+}
+
+/** The run key of an entry: a Claude agent's effort is its own, or the Claude agent's default. */
+function runKey(entry: LeaderboardEntry): RunKey {
+  return { agent: entry.agent, ...(isClaude(entry.agent) ? { effort: entry.effort ?? DEFAULT_AGENT_EFFORT } : {}) };
+}
+
+/** A row's `effort`: the one its run key records, which stored results must match to be reused. */
+function effortOf(entry: LeaderboardEntry): { effort?: Effort } {
+  const { effort } = runKey(entry);
+  return effort ? { effort } : {};
+}
+
+/** Why results run under `had` cannot stand in for `want`. Without a run.json, nothing says what they ran. */
+export function changedRunKey(had: RunKey | undefined, want: RunKey): string | undefined {
+  if (!had) return "they have no run.json, so their agent spec can't be checked";
+  if (had.agent !== want.agent) return `they are for agent ${had.agent}, not ${want.agent}`;
+  // A run.json written before effort was recorded: every Claude agent then ran at medium.
+  const ran = had.effort ?? (isClaude(had.agent) ? "medium" : undefined);
+  if (ran !== want.effort) return `they ran at effort ${ran ?? "none"}, not ${want.effort ?? "none"}`;
+  return undefined;
+}
+
+type Where = Pick<RunInfo, "provider" | "region">;
+
+/**
+ * Where an entry's calls went, out of the board's: the provider when the entry or the caller is a Claude model, and
+ * the region when either calls Bedrock. Without the caller's spec, the board's provider and region as they are.
+ */
+export function entryWhere(info: Where, agentSpec: string, userSpec: string | undefined): Where {
+  if (userSpec === undefined) return { ...(info.provider ? { provider: info.provider } : {}), ...(info.region ? { region: info.region } : {}) };
+  const uses = bedrockUse([userSpec, agentSpec], info.provider ?? "anthropic");
+  return { ...(uses.claude && info.provider ? { provider: info.provider } : {}), ...(uses.bedrock && info.region ? { region: info.region } : {}) };
+}
+
+/**
+ * Why results that ran where `had` says can't stand in for an entry that runs where `now` says: another provider
+ * or Bedrock region, or a run.json from before either was recorded. Only what the entry uses now is compared.
+ * Price, routing and the served model can differ.
+ */
+export function changedWhere(had: Where, now: Where): string | undefined {
+  if (now.provider !== undefined && had.provider !== now.provider) return `they ran on ${had.provider ?? "an unrecorded provider"}, not ${now.provider}`;
+  if (now.region !== undefined && had.region !== now.region) return `they ran in ${had.region ?? "an unrecorded region"}, not ${now.region}`;
+  return undefined;
+}
+
+/** "3 of 200 trial(s) crashed: <the first error>", or undefined when no trial crashed. */
+function crashOf(r: SuiteResult): string | undefined {
+  const crashes = r.tasks.flatMap((t) => t.trials.filter((tr) => tr.endReason === "error"));
+  if (crashes.length === 0) return undefined;
+  const trials = r.tasks.reduce((n, t) => n + t.trials.length, 0);
+  return `${crashes.length} of ${trials} trial(s) crashed: ${crashes[0]!.error ?? "unknown error"}`;
+}
+
+function errorRow(entry: LeaderboardEntry, error: string): LeaderboardRow {
+  return {
+    label: entry.label,
+    agent: entry.agent,
+    ...effortOf(entry),
+    baseline: false,
+    passHat1: Number.NaN,
+    passHatK: Number.NaN,
+    tasks: 0,
+    trials: 0,
+    violations: {},
+    soft: {},
+    costUsd: null,
+    costPerTrialUsd: null,
+    agentCostPerTrialUsd: null,
+    agentTurnP95Ms: null,
+    agentTokens: 0,
+    error,
+  };
+}
+
+export function toRow(entry: LeaderboardEntry, r: SuiteResult, baseline = false): LeaderboardRow {
+  const violations: Record<string, number> = {};
+  for (const m of r.failureModes) if (m.kind === "invariant") violations[m.id] = m.count;
+  const trials = r.tasks.reduce((n, t) => n + t.trials.length, 0);
+  // Priced now, not as stored: every cost column of a reused row follows the prices this board records.
+  const cost = costOf(r.usage.agent, r.usage.user);
+  const hasUsage = totalTokens(r.usage.agent).calls + totalTokens(r.usage.user).calls > 0;
+  return {
+    label: entry.label,
+    agent: entry.agent,
+    ...effortOf(entry),
+    baseline,
+    passHat1: r.passHat["1"] ?? Number.NaN,
+    passHatK: r.passHat[String(r.k)] ?? Number.NaN,
+    tasks: r.tasks.length,
+    trials,
+    violations,
+    ...(r.failureModes[0] ? { topFailure: `${r.failureModes[0].id} (${r.failureModes[0].count}×)` } : {}),
+    soft: Object.fromEntries((r.soft ?? []).map((x) => [x.id, { applied: x.applied, broken: x.broken, rate: x.rate }])),
+    costUsd: hasUsage ? cost : null,
+    costPerTrialUsd: hasUsage && cost !== null && trials ? cost / trials : null,
+    agentCostPerTrialUsd: (() => {
+      const agentCost = totalTokens(r.usage.agent).calls > 0 ? costOf(r.usage.agent) : null;
+      return agentCost !== null && trials ? agentCost / trials : null;
+    })(),
+    agentTurnP95Ms: r.latency.agentTurnP95Ms,
+    agentTokens: (() => {
+      const t = totalTokens(r.usage.agent);
+      return t.input + t.output + t.cacheRead + t.cacheWrite;
+    })(),
+  };
+}
+
+/** A model's stored results, graded again under the current rules when they can stand in for this run, or why they can't. */
+type Stored = { stored: SuiteResult; result: SuiteResult; stale?: undefined } | { stored: SuiteResult; result?: undefined; stale: string };
+
+/** A stored file that exists but can't be read as what its name says, so nothing tells whether its results can be reused. */
+class UnreadableStoredFile extends Error {}
+
+/** A model's stored file, parsed, or undefined when there is none. */
+async function readStoredFile<T>(file: string, parse: (text: string, file: string) => T): Promise<T | undefined> {
+  let text: string;
+  try {
+    text = await readFile(file, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new UnreadableStoredFile(`${file} can't be read: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  try {
+    return parse(text, file);
+  } catch (err) {
+    throw new UnreadableStoredFile(err instanceof Error ? err.message : String(err));
+  }
+}
+
+function parseRunJson(text: string, file: string): RunKey & Partial<RunInfo> {
+  const r = parseJson(text, file) as Partial<RunKey> | null;
+  if (!r || typeof r !== "object" || Array.isArray(r) || typeof r.agent !== "string") throw new Error(`${file} is not a run.json written by \`sandtable leaderboard\``);
+  return r as RunKey & Partial<RunInfo>;
+}
+
+async function readStored(dir: string, key: RunKey, where: Where | undefined, domain: Domain, want: { k: number; user: string; taskIds: string[] }): Promise<Stored | undefined> {
+  const stored = await readStoredFile(path.join(dir, "results.json"), parseResults);
+  if (!stored) return undefined;
+  const storedKey = await readStoredFile(path.join(dir, "run.json"), parseRunJson);
+  const stale =
+    changedRunKey(storedKey, key) ??
+    (storedKey && where ? changedWhere(storedKey, where) : undefined) ??
+    staleReason(stored, { domain: domain.name, ...want });
+  if (stale) return { stored, stale };
+  // Stored verdicts are never reused as they are: the stored conversations are graded again under the
+  // current rules, so every row of the board is graded by the same grader.
+  try {
+    return { stored, result: regradeSuite(domain, stored) };
+  } catch (err) {
+    if (!(err instanceof RegradeError)) throw err;
+    return { stored, stale: err.message };
+  }
+}
+
+/** A model's results.json, run.json and report.html, each written whole or not at all. */
+async function writeRun(dir: string, result: SuiteResult, info: object): Promise<void> {
+  await mkdir(dir, { recursive: true });
+  await writeFileAtomic(path.join(dir, "results.json"), JSON.stringify(result, null, 2));
+  await writeFileAtomic(path.join(dir, "run.json"), JSON.stringify(info, null, 2));
+  await writeFileAtomic(path.join(dir, "report.html"), renderHtml(result));
+}
+
+/** A model's crashed runs are kept inside its folder: `crashed/`, then `crashed-2/`, `crashed-3/`… */
+const crashedName = (i: number) => (i === 1 ? "crashed" : `crashed-${i}`);
+
+/** The crashed runs kept in a model's folder, in order. */
+async function crashedDirs(dir: string): Promise<string[]> {
+  const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+  const index = (name: string) => Number(name.slice("crashed-".length)) || 1;
+  return entries
+    .filter((e) => e.isDirectory() && /^crashed(-[1-9]\d*)?$/.test(e.name))
+    .map((e) => e.name)
+    .sort((a, b) => index(a) - index(b))
+    .map((name) => path.join(dir, name));
+}
+
+/**
+ * Why the crashed run kept in `dir` is not one of this run, or undefined when it is. A results.json that is missing
+ * or can't be read never matches, so its folder is never removed or replaced.
+ */
+async function otherCrashedRun(dir: string, want: RunScope): Promise<string | undefined> {
+  try {
+    const other = otherRun(JSON.parse(await readFile(path.join(dir, "results.json"), "utf8")) as SuiteResult, want);
+    return other && `whose results are of another run (${other})`;
+  } catch {
+    return "whose results.json can't be read";
+  }
+}
+
+/** The crashed runs in a model's folder: this run's, and the others with why each isn't this run's. */
+async function crashedRuns(dir: string, want: RunScope): Promise<{ same: string[]; other: { dir: string; why: string }[] }> {
+  const same: string[] = [];
+  const other: { dir: string; why: string }[] = [];
+  for (const d of await crashedDirs(dir)) {
+    const why = await otherCrashedRun(d, want);
+    if (why) other.push({ dir: d, why });
+    else same.push(d);
+  }
+  return { same, other };
+}
+
+/** "kept the earlier crashed run in <dir>, whose …" for each crashed run of another run. */
+function keptNote(other: { dir: string; why: string }[]): string {
+  return other.map((o) => `kept the earlier crashed run in ${o.dir}, ${o.why}`).join("; ");
+}
+
+/**
+ * Run several agents on one domain under the same simulated users, plus a do-nothing
+ * baseline, and rank them by pass^k. Each entry's full results are kept next to the
+ * leaderboard so every number can be traced to its trajectories.
+ */
+export async function runLeaderboard(opts: LeaderboardOptions): Promise<LeaderboardResult> {
+  const { domain, entries, user, k, outDir } = opts;
+  const unknown = (opts.taskIds ?? []).filter((id) => !domain.tasks.some((t) => t.id === id));
+  if (unknown.length) throw new Error(`unknown task id(s): ${unknown.join(", ")}`);
+  const folders = new Map<string, string>();
+  for (const entry of entries) {
+    const problem = effortProblem(entry);
+    if (problem) throw new Error(`${entry.label}: ${problem}`);
+    if (entry.agent === "noop") continue;
+    // Each model keeps its results in a folder named after its label: two labels that make the same name would overwrite each other.
+    const folder = slugify(entry.label);
+    const other = folders.get(folder);
+    if (other !== undefined) throw new Error(`"${other}" and "${entry.label}" would share the folder ${folder}/: give one of them another label`);
+    folders.set(folder, entry.label);
+  }
+  const tasks = opts.taskIds?.length ? domain.tasks.filter((t) => opts.taskIds!.includes(t.id)) : domain.tasks;
+  const taskIds = tasks.map((t) => t.id);
+  const folderOf = (entry: LeaderboardEntry) => path.join(outDir, slugify(entry.label));
+  const whereOf = (entry: LeaderboardEntry) => (opts.runInfo ? entryWhere(opts.runInfo, entry.agent, opts.userSpec) : undefined);
+
+  // Stored results may be the only copy of paid conversations, so a resumed board never replaces them: when any
+  // model's can't stand in for this run (a quick check of a few tasks or another k, another agent spec, effort,
+  // provider or region, or changed inputs), nothing runs and the output says why. --no-resume replaces them all.
+  const reused = new Map<LeaderboardEntry, { stored: SuiteResult; result: SuiteResult }>();
+  if (opts.resume ?? true) {
+    const kept: string[] = [];
+    const unreadable: string[] = [];
+    for (const entry of entries) {
+      if (entry.agent === "noop") continue;
+      let s: Stored | undefined;
+      try {
+        s = await readStored(folderOf(entry), runKey(entry), whereOf(entry), domain, { k, user: user.name, taskIds });
+      } catch (err) {
+        if (!(err instanceof UnreadableStoredFile)) throw err;
+        unreadable.push(`  - ${entry.label}: ${err.message}`);
+        continue;
+      }
+      if (s?.stale !== undefined) kept.push(`  - ${entry.label}, in ${folderOf(entry)} (${s.stored.tasks.length} task(s) at k=${s.stored.k}): ${s.stale}`);
+      else if (s) reused.set(entry, s);
+    }
+    // Every broken file at once: a board of many models shouldn't take a run per file to find them all.
+    if (unreadable.length) {
+      throw new Error(
+        [
+          `${unreadable.length} model(s) have stored files the board can't read:`,
+          ...unreadable,
+          `Nothing ran. Fix each file, or move that model's folder out of ${outDir} and run the board again to rerun the model. --no-resume reruns every model and replaces all their results.`,
+        ].join("\n"),
+      );
+    }
+    if (kept.length) {
+      throw new Error(
+        [
+          `${kept.length} model(s) have stored results this run can't reuse, and running them would replace those results:`,
+          ...kept,
+          "Nothing ran, and the stored results are kept: they may be the only copy of paid conversations. For a check of other tasks, another k or another caller, pass another -o. To rerun a model, delete or move its folder first; --no-resume reruns every model and replaces all their results.",
+        ].join("\n"),
+      );
+    }
+  }
+  await mkdir(outDir, { recursive: true });
+  const rows: LeaderboardRow[] = [];
+
+  for (const entry of entries) {
+    if (entry.agent === "noop") {
+      opts.onEntry?.(entry.label, "skipped", "the do-nothing baseline is always included");
+      continue;
+    }
+    const dir = folderOf(entry);
+    const file = path.join(dir, "results.json");
+    const reuse = reused.get(entry);
+    if (reuse) {
+      const { stored, result } = reuse;
+      // Reused results keep earlier crashed runs beside them: say so, since publishing the folder would ship them.
+      const crashed = await crashedDirs(dir);
+      const leftover =
+        crashed.length === 0
+          ? undefined
+          : crashed.length === 1
+            ? `an earlier crashed run is still in ${crashed[0]}: delete it before publishing this folder`
+            : `earlier crashed runs are still in ${crashed.join(", ")}: delete them before publishing this folder`;
+      if (JSON.stringify(result) === JSON.stringify(stored)) opts.onEntry?.(entry.label, "cached", leftover);
+      else {
+        // The current rules grade the stored conversations differently: rewrite their files. These hold the
+        // only copy of paid conversations, so a write is never left half done.
+        await writeFileAtomic(file, JSON.stringify(result, null, 2));
+        await writeFileAtomic(path.join(dir, "report.html"), renderHtml(result));
+        const changed = `${changedVerdicts(stored, result).length} verdict(s) changed under the current rules`;
+        opts.onEntry?.(entry.label, "regraded", leftover ? `${changed}; ${leftover}` : changed);
+      }
+      rows.push(toRow(entry, result));
+      continue;
+    }
+    // No stored results, or --no-resume: run the model.
+    let result: SuiteResult;
+    try {
+      const agent = await opts.resolveAgent(entry.agent, entry.effort);
+      result = await runSuite({ domain, agent, user, k, taskIds, concurrency: opts.concurrency ?? 4 });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      opts.onEntry?.(entry.label, "failed", message);
+      rows.push(errorRow(entry, message));
+      continue;
+    }
+    const key = runKey(entry);
+    const info = opts.runInfo ? { sandtable: opts.runInfo.sandtable, ...whereOf(entry) } : {};
+    // A crashed trial (credentials, throttling) says nothing about the model: show the row as an
+    // error instead of ranking it, and let the next run retry the model.
+    const message = crashOf(result);
+    // This run supersedes an earlier crashed run of the same run. A crashed run of another run, such as a full
+    // board's under a quick check, may hold the only copy of paid conversations: it is never removed or replaced.
+    const crashed = await crashedRuns(dir, { domain: domain.name, k, user: user.name, taskIds });
+    if (message) {
+      // The stored files may be the only copy of paid conversations: a crashed rerun goes beside them, never over them.
+      // It replaces this run's earlier crashed run, or else goes in the first free crashed folder.
+      let crashedDir = crashed.same[0];
+      for (let i = 1; !crashedDir; i++) {
+        const free = path.join(dir, crashedName(i));
+        if (!(await exists(free))) crashedDir = free;
+      }
+      await writeRun(crashedDir, result, { ...key, ...info });
+      const kept = crashed.other.length ? `; ${keptNote(crashed.other)}` : "";
+      opts.onEntry?.(entry.label, "failed", `${message}; the crashed run is in ${crashedDir}${(await exists(file)) ? ", and the stored results are kept" : ""}${kept}`);
+      rows.push(errorRow(entry, message));
+      continue;
+    }
+    await writeRun(dir, result, { ...key, ...info });
+    // A good run supersedes an earlier crashed one of the same run, which would otherwise be published with these results.
+    // A folder that can't be removed (a locked file on Windows) is reported, never fatal: this model's run is saved.
+    const notes: string[] = [];
+    for (const d of crashed.same) {
+      notes.push(
+        await rm(d, { recursive: true, force: true, maxRetries: 3 }).then(
+          () => `removed the earlier crashed run in ${d}`,
+          (err: Error) => `could not remove the earlier crashed run in ${d}: ${err.message}`,
+        ),
+      );
+    }
+    if (crashed.other.length) notes.push(`${keptNote(crashed.other)}: delete ${crashed.other.length === 1 ? "it" : "them"} before publishing this folder`);
+    opts.onEntry?.(entry.label, "ran", notes.length ? notes.join("; ") : undefined);
+    rows.push(toRow(entry, result));
+  }
+
+  // Do-nothing baseline: the share of the suite that rewards inaction. Scripted users keep it free
+  // when every task has a script; otherwise it runs under the same simulated user as the models.
+  const scripted = tasks.every((t) => t.user.script?.length);
+  const noop = await runSuite({ domain, agent: noopAgent(), user: scripted ? scriptedUser() : user, k: scripted ? 1 : k, taskIds });
+  const baselineEntry = { label: "Do-nothing baseline", agent: "noop" };
+  const baselineCrash = crashOf(noop);
+  if (baselineCrash) {
+    // A baseline whose caller crashed sets no floor: it shows as an error, like a model.
+    opts.onEntry?.(baselineEntry.label, "failed", baselineCrash);
+    rows.push({ ...errorRow(baselineEntry, baselineCrash), baseline: true });
+  } else {
+    const baseline = toRow(baselineEntry, noop, true);
+    // A scripted noop run is deterministic, so its pass^k equals its pass^1.
+    if (scripted) baseline.passHatK = baseline.passHat1;
+    rows.push(baseline);
+  }
+
+  // Errored rows (NaN) sort last; a 0% model still ranks above them.
+  const score = (x: number) => (Number.isNaN(x) ? -1 : x);
+  rows.sort((a, b) => score(b.passHatK) - score(a.passHatK) || score(b.passHat1) - score(a.passHat1));
+  const result: LeaderboardResult = {
+    version: 1,
+    domain: domain.name,
+    user: user.name,
+    k,
+    generatedAt: new Date().toISOString(),
+    ...(opts.runInfo ? { sandtable: opts.runInfo.sandtable } : {}),
+    ...(opts.prices ? { prices: opts.prices } : {}),
+    rows,
+  };
+  await writeFile(path.join(outDir, "leaderboard.json"), JSON.stringify(result, null, 2));
+  await writeFile(path.join(outDir, "LEADERBOARD.md"), renderLeaderboardMarkdown(result));
+  await writeFile(path.join(outDir, "leaderboard.html"), renderLeaderboardHtml(result));
+  return result;
+}
+
+const pct = (x: number) => (Number.isNaN(x) ? "n/a" : `${(x * 100).toFixed(1)}%`);
+const usd = (x: number | null) => (x === null ? "n/a" : x < 0.01 ? `$${x.toFixed(4)}` : `$${x.toFixed(3)}`);
+const secs = (ms: number | null) => (ms === null ? "n/a" : `${(ms / 1000).toFixed(1)}s`);
+/** A model's name, and for a Claude agent the effort it ran at: "Claude Sonnet 5.5 (effort high)". */
+const modelName = (r: LeaderboardRow) => (r.effort ? `${r.label} (effort ${r.effort})` : r.label);
+const totalViolations = (r: LeaderboardRow) => Object.values(r.violations).reduce((a, b) => a + b, 0);
+/** pass^1, plus pass^k when k > 1. */
+const passHeads = (k: number) => (k === 1 ? ["pass^1"] : ["pass^1", `pass^${k}`]);
+const passCells = (r: LeaderboardRow, k: number) => (k === 1 ? [pct(r.passHat1)] : [pct(r.passHat1), pct(r.passHatK)]);
+const howOften = (k: number) => (k === 1 ? "once" : `${k} times`);
+const passMeaning = (k: number) => (k === 1 ? "pass^1 is the share of tasks that passed." : `pass^${k} is the share of tasks where all ${k} trials passed.`);
+const COST_NOTE = "Cost / trial counts the agent's model only; leaderboard.json also has the cost with the simulated caller.";
+const SOFT_NOTE = "Soft rules never fail a trial: each shows how often the model broke it, in the trials where it applied.";
+/** Whether any row reports a soft invariant, so the table needs its column. */
+const hasSoft = (l: LeaderboardResult) => l.rows.some((r) => Object.keys(r.soft ?? {}).length > 0);
+/** e.g. "counter-at-ceiling 37.5% (3/8)". */
+export function softCell(r: LeaderboardRow): string {
+  return Object.entries(r.soft ?? {})
+    .map(([id, x]) => `${id} ${x.rate === null ? "n/a" : `${pct(x.rate)} (${x.broken}/${x.applied})`}`)
+    .join("; ");
+}
+
+export function renderLeaderboardMarkdown(l: LeaderboardResult): string {
+  const soft = hasSoft(l);
+  const heads = ["#", "Model", ...passHeads(l.k), "Rule violations", "Top failure", ...(soft ? ["Soft rules"] : []), "Cost / trial", "p95 turn"];
+  const lines = [
+    `# Leaderboard: ${l.domain}`,
+    "",
+    `Each model plays the agent on every task ${howOften(l.k)}, against the same simulated callers (${l.user}). ${passMeaning(l.k)} Grading is deterministic: end state, rules checked on every tool call and message, required and forbidden tools. ${soft ? `${SOFT_NOTE} ` : ""}${COST_NOTE}`,
+    "",
+    `| ${heads.join(" | ")} |`,
+    `|${heads.map(() => "---").join("|")}|`,
+  ];
+  let rank = 0;
+  for (const r of l.rows) {
+    const place = r.baseline || r.error ? "" : String(++rank);
+    const model = r.baseline ? `_${r.label}_` : modelName(r);
+    const cells = r.error
+      ? [place, model, "error", ...passHeads(l.k).slice(1).map(() => ""), "", r.error.replace(/\|/g, "/").slice(0, 80), ...(soft ? [""] : []), "", ""]
+      : [place, model, ...passCells(r, l.k), String(totalViolations(r)), r.topFailure ?? "", ...(soft ? [softCell(r)] : []), usd(r.agentCostPerTrialUsd), secs(r.agentTurnP95Ms)];
+    lines.push(`| ${cells.join(" | ")} |`);
+  }
+  lines.push("", `Generated ${l.generatedAt} with [sandtable](https://github.com/sandtable-ai/sandtable)${builtWith(l.sandtable)}. Per-model reports and trajectories are in the folders next to this file.`, "");
+  return lines.join("\n");
+}
+
+export function renderLeaderboardHtml(l: LeaderboardResult): string {
+  const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!);
+  const soft = hasSoft(l);
+  const body = l.rows
+    .map((r) => {
+      const effort = r.effort ? ` <span class="effort">effort ${esc(r.effort)}</span>` : "";
+      const link = r.baseline ? esc(r.label) : `<a href="./${slugify(r.label)}/report.html">${esc(r.label)}</a>${effort}`;
+      if (r.error) return `<tr${r.baseline ? ' class="base"' : ""}><td>${link}</td><td colspan="${passHeads(l.k).length + (soft ? 5 : 4)}" class="err">${esc(r.error)}</td></tr>`;
+      const pass = passCells(r, l.k).map((c, i, all) => (i === all.length - 1 ? `<td><b>${c}</b></td>` : `<td>${c}</td>`)).join("");
+      return `<tr${r.baseline ? ' class="base"' : ""}><td>${link}</td>${pass}<td>${totalViolations(r)}</td><td>${esc(r.topFailure ?? "")}</td>${soft ? `<td>${esc(softCell(r))}</td>` : ""}<td>${usd(r.agentCostPerTrialUsd)}</td><td>${secs(r.agentTurnP95Ms)}</td></tr>`;
+    })
+    .join("\n");
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Leaderboard · ${esc(l.domain)}</title>
+<style>
+${BRAND_CSS}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 var(--sans)}
+main{max-width:1040px;margin:0 auto;padding:32px 16px 64px}h1{font-size:22px;line-height:32px;margin:0 0 8px}
+p{color:var(--muted);max-width:780px}.wrap{overflow-x:auto}
+table{width:100%;border-collapse:separate;border-spacing:0;background:var(--card);border:1px solid var(--line);border-radius:4px}
+th,td{text-align:left;padding:8px 16px;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums}tr:last-child td{border-bottom:0}
+th{font-size:12px;color:var(--muted)}tr.base td{color:var(--muted);font-style:italic}.err{color:var(--bad-text)}a{color:inherit}.effort{color:var(--muted);font-size:12px;white-space:nowrap}
+</style></head><body><main>
+<div class="head">${MARK_SVG}<h1>Leaderboard: ${esc(l.domain)}</h1></div>
+<p>Each model plays the agent on every task ${howOften(l.k)} against the same simulated callers (${esc(l.user)}). ${passMeaning(l.k).replace(/^(pass\^\d+)/, "<b>$1</b>")} Grading is deterministic: end state, rules checked on every tool call and message, required and forbidden tools. ${soft ? `${SOFT_NOTE} ` : ""}${COST_NOTE} Click a model for its full report and trajectories.</p>
+<div class="wrap"><table><thead><tr><th>Model</th>${passHeads(l.k).map((h) => `<th>${h}</th>`).join("")}<th>Rule violations</th><th>Top failure</th>${soft ? "<th>Soft rules</th>" : ""}<th>Cost / trial</th><th>p95 turn</th></tr></thead>
+<tbody>
+${body}
+</tbody></table></div>
+<p>Generated ${esc(l.generatedAt)} with <a href="https://github.com/sandtable-ai/sandtable">sandtable</a>${esc(builtWith(l.sandtable))}.</p>
+</main></body></html>
+`;
+}

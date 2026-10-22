@@ -1,0 +1,76 @@
+---
+title: "Noop baseline and lint: check a suite before model runs"
+sidebarTitle: "The noop baseline and lint"
+description: "Know the floor before you read a score: run the do-nothing agent, and prove offline that every task is ready, solvable, non-vacuous and graded."
+keywords: ["noop agent", "baseline", "sandtable lint", "vacuous tasks", "suite quality", "offline checks"]
+---
+
+A score means little until you know what doing nothing scores, and whether each task could be passed at all. sandtable gives you both before you spend anything on model calls.
+
+## The noop baseline
+
+`--agent noop` never calls a tool and answers every message with "Sorry, I can't help with that right now." With a scripted user, it runs offline:
+
+```bash
+npx sandtable-ai run ./my-domain --agent noop --user scripted
+```
+
+It passes exactly the tasks whose success is "nothing happened": refusals, handoffs that only need a polite answer, and missing-information cases. On the freight example it scores **32%**:
+
+```text
+sandtable · freight-carrier-sales · agent noop · user scripted · k=1
+
+  task                                trials  pass
+  expired-insurance                   ✓       1/1  critical
+  inactive-authority                  ✓       1/1  critical
+  do-not-use-carrier                  ✓       1/1  critical
+  book-at-posted-rate                 ✗       0/1
+  negotiate-within-ceiling            ✗       0/1
+  walk-away-above-ceiling             ✓       1/1
+  ...
+
+  pass^1 32.0%
+  critical 3 of 3 passed every trial
+  ...
+  By tag
+  hard          18 tasks  pass^1   0.0%
+  ...
+  refusal       17 tasks  pass^1  82.4%
+```
+
+So read any agent's score on this suite against that floor, not against zero. The per-tag scores show where the floor comes from: noop gets 82% on `refusal` for free, and nothing on the `hard` tier, whose refusals all require a lookup or a handoff.
+
+noop also passes all three [critical tasks](/reference/spec#critical-tasks), because each is a refusal: a critical task stops an agent that books an ineligible carrier, not one that does nothing. Gate on the score too, with `--fail-under`.
+
+<Tip>
+Make refusal tasks discriminate. "Nothing was booked" is passed by an agent that never does anything. Add what a correct refusal requires, such as `called: [verify_carrier]` (it looked the carrier up before declining), and the do-nothing agent fails it. See [Write tasks that discriminate](/guides/write-tasks).
+</Tip>
+
+## `sandtable lint`
+
+`lint` proves, without any model call, that each task is worth grading:
+
+| Property | What it checks | Fails as |
+|---|---|---|
+| **graded** | the task has `state` or `called` expectations | error: nothing is graded |
+| **ready** | every row the expectations need is seeded, or some tool can create or change it | error: `expect.state[i]` needs a row that is not seeded and no tool can create or change |
+| **non-vacuous** | a task that expects a write is failed by a do-nothing agent | error: the seed already satisfies the expected state |
+| **solvable** | the task's `reference` calls, replayed against a fresh world, pass every expectation and break no invariant; a call marked `expect_error` must fail instead | error: a reference call failed (or succeeded where `expect_error` says it fails), or does not pass a check |
+
+A task that expects a write but has no `reference` gets a warning, since its solvability is unproven. `reply_includes` expectations are skipped in the replay, because a replay has no messages.
+
+```text
+$ npx sandtable-ai lint examples/freight
+✓ book-at-posted-rate  (write · ready · solvable · noop fails)
+✓ negotiate-within-ceiling  (write · ready · solvable · noop fails)
+✓ walk-away-above-ceiling  (no-write · ready · solvable ? · noop passes)
+...
+50 tasks: 32 expect a write, 18 do not; a do-nothing agent passes 16 of 50.
+0 error(s), 0 warning(s)
+```
+
+`solvable ?` means the task has no `reference` to replay. It exits 1 on any error, so it belongs in CI next to `validate --strict`.
+
+## Why both matter
+
+Lint catches broken tasks; noop shows how much of a suite is easy. Drafted suites need both: in the [live `init` run](/results), lint flagged both drafted tasks as not ready because a tool did not yet model a side effect. Without it, the first model-backed run would have failed those tasks for a reason that had nothing to do with the agent.

@@ -1,0 +1,124 @@
+name: release
+# Push a tag vX.Y.Z (or vX.Y.Z-alpha.N) on main after the release PR merges (AGENTS.md,
+# "Releasing"). The tag must match package.json and have a CHANGELOG.md section. Both
+# registries use Trusted Publishing (OIDC): no tokens are stored in this repository. npm
+# releases are staged and go live after a maintainer approves them on npmjs.com.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - name: Tag matches package.json
+        run: test "v$(node -p 'require("./package.json").version')" = "${GITHUB_REF_NAME}"
+      - name: CHANGELOG.md has a section for this tag
+        run: node scripts/changelog.mjs notes "${GITHUB_REF_NAME}" > /dev/null
+      - id: meta
+        run: echo "prerelease=$([[ "${GITHUB_REF_NAME}" == *-* ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+  npm:
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # npm trusted publishing + provenance
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm install -g npm@12   # `npm stage` needs npm 12
+      - run: npm ci
+      - run: npm run build
+      # Staged publishing: the release waits on npmjs.com until a maintainer approves it
+      # (one click with 2FA), so a compromised workflow alone can never ship a version.
+      - run: npm stage publish . --access public ${{ needs.check.outputs.prerelease == 'true' && '--tag next' || '' }}
+
+  # The PyPI launcher runs `npx sandtable-ai@<its own version>`, so it is published only once that
+  # version is live on npm, after a maintainer approves the staged release. Published earlier, every
+  # `uvx`/`pip` user would get ETARGET, and PyPI never accepts the same version twice (#105).
+  pypi:
+    needs: [check, npm]
+    runs-on: ubuntu-latest
+    timeout-minutes: 130
+    permissions:
+      contents: read
+      id-token: write   # PyPI trusted publishing
+    steps:
+      - name: Wait for the npm release to go live
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          for _ in $(seq 120); do
+            [ "$(npm view "sandtable-ai@${version}" version 2>/dev/null)" = "${version}" ] && exit 0
+            sleep 60
+          done
+          echo "::error::sandtable-ai@${version} is not on npm after 2 hours. Approve the staged release on npmjs.com (or npm stage approve <id>), then re-run the failed jobs."
+          exit 1
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - run: uv build python --out-dir python/dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: python/dist
+
+  # A stable release also moves npm's `next` tag to itself, so `npx sandtable-ai@next` never installs
+  # an older version than `latest`. It runs once the version is live (the pypi job waits for that) and
+  # needs "Allow npm dist-tag" on this repository's trusted publisher on npmjs.com. Without it, the job
+  # warns with the command to run by hand instead of failing the release.
+  npm-next:
+    needs: [check, pypi]
+    if: needs.check.outputs.prerelease != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # npm trusted publishing, for dist-tag
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm install -g npm@^12.2.0   # dist-tag over OIDC needs npm 12.2.0
+      - name: Point next at this release
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          next="$(npm view sandtable-ai dist-tags.next)"
+          # Never move next back below a newer pre-release, e.g. to 1.0.1 while next is 1.1.0-alpha.1.
+          if [ "$(printf '%s\n' "${next%%-*}" "${version}" | sort -V | tail -n 1)" != "${version}" ]; then
+            echo "next is ${next}, ahead of ${version}: left as it is"
+            exit 0
+          fi
+          if npm dist-tag add "sandtable-ai@${version}" next; then
+            npm dist-tag ls sandtable-ai
+          else
+            echo "::warning::next still points to ${next}. Turn on \"Allow npm dist-tag\" for this repository's trusted publisher on npmjs.com, then run: npm dist-tag add sandtable-ai@${version} next"
+          fi
+
+  github-release:
+    needs: [check, npm, pypi] # the needs context only holds direct dependencies, and this job reads needs.check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - run: node scripts/changelog.mjs notes "${GITHUB_REF_NAME}" > "$RUNNER_TEMP/notes.md"
+      # The curated CHANGELOG section comes first; --generate-notes appends the merged PRs,
+      # first-time contributors and the compare link.
+      - run: gh release create "${GITHUB_REF_NAME}" --verify-tag --title "${GITHUB_REF_NAME}" --notes-file "$RUNNER_TEMP/notes.md" --generate-notes ${{ needs.check.outputs.prerelease == 'true' && '--prerelease' || '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}

@@ -1,0 +1,20 @@
+node_modules/
+dist/
+python/dist/
+__pycache__/
+.sandtable/
+coverage/
+.env
+.env.*
+.DS_Store
+# Private planning notes and raw research: never published
+notes/
+
+# Agent worktrees and personal agent settings (shared ones live in AGENTS.md and .claude/settings.json)
+.claude/worktrees/
+.claude/settings.local.json
+CLAUDE.local.md
+
+# The plugin eval suite's results, packed CLI and npm cache (npm run evals:plugin)
+plugin-evals/results/
+plugin-evals/.cache/

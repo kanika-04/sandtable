@@ -1,0 +1,245 @@
+---
+title: "results.json schema: scores, trials and failure modes"
+sidebarTitle: "results.json"
+description: "The file every run writes: suite scores, failure modes, per-tag scores, usage, and every trial's transcript, tool calls, checks and world diff."
+keywords: ["results.json", "output format", "SuiteResult", "TrialResult", "report.html", "JSON schema"]
+---
+
+`sandtable run` writes two files to its output directory (`--out`, or `.sandtable/runs/<timestamp>-<domain>/`):
+
+- `results.json`: a `SuiteResult`, described below. It is the source of truth for a run.
+- `report.html`: a self-contained rendering of it, with no external assets, that you can attach to a pull request or send to a customer. `npx sandtable-ai report results.json` re-renders it.
+
+The TypeScript types are exported from the package (`SuiteResult`, `TrialResult`, `CheckResult` and the rest). Until 1.0, fields may still be added or change; `version` will change when the format breaks. `passAt`, `flipRate`, `flaky`, `skipped` and the task verdict fields are absent in results from before verdicts, in which every trial was graded.
+
+## SuiteResult
+
+| Field | Type | Description |
+|---|---|---|
+| `version` | `1` | format version |
+| `runId` | string | unique per run, e.g. `20261018T210512-k3f9`; prefixes the agent session ids |
+| `domain` | string | the domain's `name` |
+| `agent` | string | the agent's name, such as `claude:claude-opus-5-5`, `openai:gpt-4.1-mini`, `http://localhost:8787/step` (an HTTP agent is named by its URL) |
+| `user` | string | the simulated user's name, such as `claude:claude-haiku-5-5` or `scripted` |
+| `k` | number | trials per task |
+| `inputs` | string | a hash of what the agent and the simulated user were given in these tasks: the agent's system prompt and tool schemas, and each task's caller prompt, opening line and turn limit (and script, for the scripted user). [`sandtable regrade`](/reference/cli#regrade) re-scores the run only while it is unchanged. Absent in results from before regrade |
+| `startedAt` | string | ISO 8601 start time |
+| `durationMs` | number | wall-clock duration |
+| `tasks` | `TaskSummary[]` | one entry per task, with every trial |
+| `passHat` | object | pass^j for every j from 1 to k, keyed `"1"`, `"2"`, …, as fractions from 0 to 1, over graded trials: skipped trials are left out, and so is a task with fewer than j graded trials. `null` when no task has j graded trials |
+| `passAt` | object | pass@j for every j from 1 to k, keyed and left out the same way: the chance that at least one of j trials of a task passes, averaged over tasks |
+| `flipRate` | number or `null` | the share of tasks with at least 2 graded trials whose graded trials disagree (the flaky ones), from 0 to 1; `null` when no task has 2 graded trials, as with k = 1 |
+| `flaky` | string[] | ids of the flaky tasks, in spec order |
+| `skipped` | number | trials skipped across the run; `run` exits 2 when it isn't 0 |
+| `callerNotes` | object | `{ turns, trials }`: how many caller turns stepped out of role (see each trial's [`callerNotes`](#callernote)), and in how many trials. Absent in results from before caller notes |
+| `failureModes` | `FailureMode[]` | failed checks clustered across graded trials, most frequent first; a skipped trial's error is not one |
+| `byTag` | `TagScore[]` | scores per task tag (`untagged` for tasks without tags), weakest first |
+| `soft` | `SoftScore[]` | one entry per soft invariant in the domain, in spec order; empty when there are none |
+| `usage` | `Usage` | tokens and estimated cost, summed over trials |
+| `pendingReview` | `PendingItem[]` | drafted items not yet accepted; while non-empty, the run is provisional |
+| `latency` | object | `agentTurnP50Ms` and `agentTurnP95Ms`: time the agent took per user turn, tool calls included (`null` with no turns) |
+| `baseline` | `BaselineSnapshot` | present only in a run made with [`--baseline`](/reference/cli#compare-with-a-baseline): what it keeps of the run it was compared with |
+
+### TaskSummary
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | task id |
+| `description` | string | task description, if any |
+| `tags` | string[] | task tags |
+| `critical` | `true` | present only on a [critical task](/reference/spec#critical-tasks): any failed trial makes `run` exit 1 |
+| `trials` | `TrialResult[]` | ordered by trial number |
+| `passes` | number | trials that passed |
+| `graded` | number | trials that were graded: all but the skipped ones |
+| `skipped` | number | trials that were skipped |
+| `verdict` | string | `passed` (every graded trial passed), `failed` (none did), `flaky` (some did) or `skipped` (no trial was graded) |
+| `interval` | object | `low` and `high`: the 95% Wilson score interval for `passes / graded`, from 0 to 1; absent when no trial was graded |
+| `inputs` | string | a short hash of what the agent and the caller are given for this task and the world they act in: the policy, every tool's definition, the caller's prompt, opening and turn limit, the script under `--user scripted`, and the seed rows with the task's `given.rows`. [`--baseline`](/reference/cli#compare-with-a-baseline) labels a task whose hash changed as `changed`. Absent in results from before it |
+| `grading` | string | a short hash of how this task's trials are graded: its `expect` and `critical`, and every invariant with its `soft` flag. A drafted item's `review` is left out, so accepting it keeps the hash. Absent in results from before it |
+
+### FailureMode
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | the check id, such as `verify-before-book` or `state:bookings#1` |
+| `kind` | string | the check kind (see below) |
+| `count` | number | failed trials containing this check |
+| `tasks` | string[] | tasks where it failed |
+| `example` | string | the detail from the first occurrence |
+
+### TagScore
+
+| Field | Type | Description |
+|---|---|---|
+| `tag` | string | the tag |
+| `tasks` | number | tasks with this tag |
+| `passHat1` | number | pass^1 over those tasks' graded trials |
+| `passHatK` | number | pass^k over those tasks' graded trials |
+
+### SoftScore
+
+How often a soft invariant (`soft: true`) was broken. Soft invariants never fail a trial or change pass^k.
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | invariant id |
+| `description` | string | invariant description |
+| `tool` | string | the tool whose calls it checks; absent for `never_disclose`, which checks what the agent says |
+| `applied` | number | trials in which it applied: its tool was called, or for `never_disclose`, the agent spoke |
+| `broken` | number | trials in which it was broken at least once |
+| `rate` | number or `null` | `broken / applied`, from 0 to 1; `null` when it never applied |
+| `tasks` | string[] | tasks with at least one trial that broke it |
+| `example` | string | the detail of the first violation, when there is one |
+
+### BaselineSnapshot
+
+What a run made with `--baseline` keeps of the earlier run, so the terminal summary, `report` and `regrade` can show what changed without the earlier file. The comparison itself is not stored: it is worked out from this and the run's own tasks whenever it is shown. The library exports `compareRuns(baseline, result)`, which returns it.
+
+| Field | Type | Description |
+|---|---|---|
+| `runId` | string | the baseline's `runId` |
+| `startedAt` | string | the baseline's `startedAt` |
+| `agent`, `user` | string | the baseline's agent and simulated user |
+| `k` | number | the baseline's trials per task |
+| `inputs` | string | the baseline's `inputs` hash; absent when its `results.json` had none |
+| `passHat` | object | the baseline's own pass^1 to pass^k, over all of its tasks |
+| `tasks` | object[] | `{ id, passes, trials, inputs, grading }` for each of the baseline's tasks, in its order. `trials` counts graded trials: skipped ones are left out, as in pass^k. `inputs` and `grading` are the task's hashes, absent when the baseline's `results.json` had none |
+
+### PendingItem
+
+| Field | Type | Description |
+|---|---|---|
+| `kind` | `"tool"`, `"invariant"`, `"task"` | what is pending |
+| `id` | string | its name or id |
+| `source` | object | `file` and optional `quote`, for invariants and tasks drafted from a source |
+
+## TrialResult
+
+| Field | Type | Description |
+|---|---|---|
+| `taskId` | string | task id |
+| `trial` | number | trial number, from 0 |
+| `passed` | boolean | true only if every check passed; false for a skipped trial |
+| `skipped` | `true` | present when the trial ended in an error before the agent broke a hard invariant or called a tool listed in `not_called`: it was not graded, and the scores leave it out. Such an error is a rate limit or timeout that outlasted the adapter's retries, or an agent endpoint that went down. A trial in which the agent broke one of those before the error failed instead |
+| `checks` | `CheckResult[]` | every check, passed or failed |
+| `violations` | `Violation[]` | hard invariant violations; any one fails the trial |
+| `soft` | `SoftCheck[]` | each soft invariant that applied in this trial, and whether it was broken |
+| `callerNotes` | `CallerNote[]` | present when the simulated user stepped out of its role in some turn; never changes `passed` |
+| `events` | `TrajectoryEvent[]` | the conversation and tool calls, in order |
+| `changes` | `Change[]` | the difference between the world's seed and its final state |
+| `endReason` | string | `user_stop`, `max_turns` or `error` |
+| `turns` | number | agent replies |
+| `durationMs` | number | trial duration |
+| `usage` | `Usage` | tokens and estimated cost for this trial |
+| `error` | string | present when the trial ended with an error |
+
+A trial's status is `skipped` when `skipped` is true, else `passed` or `failed` from `passed`.
+
+### CheckResult
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | invariant id, `state:<table>[<key>]#<n>`, `called:<tool>`, `not_called:<tool>` (with an entry's `args` as `called:<tool>(<arg>=<JSON>, …)`), `reply:<phrase>` or `runtime` |
+| `kind` | string | `invariant`, `state`, `called`, `not_called`, `reply` or `runtime` |
+| `passed` | boolean | whether it passed |
+| `detail` | string | a readable explanation, such as `book_load rate=2600 exceeds the limit 2350` |
+
+### Violation
+
+| Field | Type | Description |
+|---|---|---|
+| `invariant` | string | invariant id |
+| `description` | string | invariant description |
+| `detail` | string | what happened |
+| `callIndex` | number | for tool-call violations: the index of the call |
+| `messageIndex` | number | for `never_disclose`: the index of the agent message |
+| `soft` | `true` | present on a soft invariant's violation |
+
+### SoftCheck
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | the soft invariant's id |
+| `broken` | boolean | broken at least once in this trial |
+| `violations` | `Violation[]` | each time it was broken, with the call or message |
+
+### CallerNote
+
+A caller turn in which the simulated user stepped out of its role. The patterns are deliberately narrow, so a note is worth reading, and a role break worded another way is missed. Notes are found from the transcript alone, so [`regrade`](/reference/cli#regrade) finds them again, and they never change a verdict.
+
+| Field | Type | Description |
+|---|---|---|
+| `turn` | number | the caller's turn, counting from 1 |
+| `text` | string | the sentence that was flagged, such as `The agent asked for two things at once, and my instructions say to give one.` |
+| `why` | string | `talks about its instructions`, `says its goal is met` or `talks about the agent in the third person`; several are joined with `; ` |
+
+### TrajectoryEvent
+
+One of:
+
+```jsonc
+{ "type": "user", "text": "MC 100101, Blue Mesa. I'm looking at L-1001." }
+{ "type": "agent", "text": "L-1001 pays $2100. Want me to book it?", "latencyMs": 812 }
+{ "type": "tool", "index": 0, "name": "get_load", "args": { "load_id": "L-1001" },
+  "ok": true, "result": { }, "violations": [] }   // or "ok": false with "error"
+```
+
+A tool event's `violations` lists the ids of hard invariants that call violated. When it also broke soft invariants, `soft` lists their ids.
+
+### Change
+
+| Field | Type | Description |
+|---|---|---|
+| `table` | string | table name |
+| `key` | string | row key |
+| `kind` | string | `insert`, `update` or `delete` |
+| `before` | object | the row before (updates and deletes) |
+| `after` | object | the row after (inserts and updates) |
+
+## Usage
+
+```jsonc
+// illustrative numbers
+{
+  "agent": { "claude-opus-5-5": { "calls": 12, "input": 1200, "output": 3000, "cacheRead": 40000, "cacheWrite": 8000 } },
+  "user":  { "claude-haiku-5-5": { "calls": 8, "input": 6000, "output": 900, "cacheRead": 0, "cacheWrite": 0 } },
+  "costUsd": 0.11385
+}
+```
+
+Tokens are grouped by role and model. `input` excludes cache reads and writes, following the Anthropic convention. The Claude, Bedrock Converse and OpenAI-compatible adapters record usage automatically; custom modules can call `recordUsage`; the HTTP adapter cannot see your agent's model calls, so it records none.
+
+`maxTokensStops` counts the calls whose reply stopped at the model's output-token limit: stop reason `max_tokens` on Claude and Converse, `finish_reason: "length"` on an OpenAI-compatible server. What the agent or caller said after such a call may be cut off or empty, and the grader scores it as said. The count also includes replies sandtable discarded and asked for again, such as a Converse reply whose `<reasoning>` never closed, since every call is recorded. The field appears only once a model has such a call, so a missing field means none did, or that the run is older than the field. The terminal summary and the HTML report show the count when it isn't zero.
+
+`reasoningStripped` counts the calls whose reply text held reasoning, a `<think>`, `<thinking>`, `<reasoning>` or `<analysis>` block, that the Converse or OpenAI-compatible adapter removed before the other side heard it. It appears only once a model has such a call. A count that isn't zero means the model writes its reasoning into its text; the graders never read it.
+
+`costUsd` is an estimate at list prices from `PRICES` in `src/run/usage.ts`, which holds verified prices for Claude models, plus any prices passed with `--prices`. If any model in the run has no known price, `costUsd` is `null` and reports show `n/a`.
+
+Claude's usage is keyed by the model that served it. On the Anthropic API, that is the model Claude reports, which a refusal fallback can change. On Bedrock, it is the requested ID, such as `global.anthropic.claude-opus-5-5` or `eu.anthropic.claude-opus-5-5`. A geo cross-region profile (`eu.`, `us.`, `apac.`, `us-gov.` …) is priced at 1.1× the built-in price, since "Regional and multi-region endpoints include a 10% premium over global endpoints" for Claude 4.5 models and later ([Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing)). A `global.` profile and the Anthropic API pay the built-in price. A price passed with `--prices` for the exact ID is used as is. An inference profile ARN names no model, so its usage is recorded under the bare name Claude reports and always priced at the built-in (global) price; a `--prices` entry for the ARN is never read. A bare `anthropic.` ID, such as an in-region call, also gets the built-in (global) price, which is unverified for in-region calls. Runs from before keyed Bedrock Claude usage by the bare model name, so they're priced as global.
+
+## Recipes
+
+```bash
+# pass^k, pass@k, the flip rate and skipped trials
+jq '{passHat, passAt, flipRate, flaky, skipped}' results.json
+
+# each task's verdict, and passes out of graded trials
+jq -r '.tasks[] | "\(.verdict) \(.passes)/\(.graded) \(.id)"' results.json
+
+# skipped trials and their errors
+jq -r '.tasks[].trials[] | select(.skipped) | "\(.taskId)#\(.trial): \(.error)"' results.json
+
+# every failed trial, with its failing checks
+jq -r '.tasks[] | .id as $t | .trials[] | select((.passed or .skipped) | not)
+  | "\($t)#\(.trial): \([.checks[] | select(.passed | not) | .id] | join(", "))"' results.json
+
+# failure modes, most frequent first
+jq -r '.failureModes[] | "\(.count)x \(.kind) \(.id)"' results.json
+
+# soft invariants: how often each was broken
+jq -r '.soft[] | "\(.id): \(.broken) of \(.applied) trials"' results.json
+
+# a run made with --baseline: each task's passes then and now
+jq -r '(.baseline.tasks | map({(.id): "\(.passes)/\(.trials)"}) | add) as $then
+  | .tasks[] | "\(.id): \($then[.id] // "-") -> \(.passes)/\(.graded // (.trials | length))"' results.json
+```

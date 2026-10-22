@@ -1,0 +1,84 @@
+{
+  "name": "sandtable-ai",
+  "version": "0.1.2",
+  "description": "Rehearse your AI agent on a simulated copy of your customer's world before it goes live: tau-bench-style simulations with stateful tools, policy invariants and pass^k.",
+  "license": "MIT",
+  "homepage": "https://sandtable.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sandtable-ai/sandtable.git"
+  },
+  "bugs": "https://github.com/sandtable-ai/sandtable/issues",
+  "type": "module",
+  "bin": {
+    "sandtable": "dist/cli.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "examples/freight",
+    "examples/clinic",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "sandtable": "node src/cli.ts",
+    "demo": "node src/cli.ts demo",
+    "smoke": "node dist/cli.js lint examples/freight && node dist/cli.js lint examples/clinic && node dist/cli.js run examples/freight --agent scripted:careful --user scripted --fail-under 100 --no-html && node dist/cli.js run examples/clinic --agent scripted:clinic-careful --user scripted --fail-under 100 --no-html",
+    "check": "npm run typecheck && npm run build && npm test && node scripts/sync-version.mjs --check && node scripts/changelog.mjs check && npm run smoke",
+    "preversion": "node scripts/changelog.mjs check --release",
+    "version": "node scripts/sync-version.mjs && node scripts/changelog.mjs release && git add python plugin .claude-plugin CHANGELOG.md",
+    "evals:pack": "npm run build && node -e \"require('node:fs').mkdirSync('plugin-evals/.cache', { recursive: true })\" && npm pack --silent --pack-destination plugin-evals/.cache",
+    "evals:plugin": "npm run evals:pack && claude plugin eval . --eval-dir plugin-evals --scaffold --allow-tools Bash Edit Write"
+  },
+  "keywords": [
+    "sandtable",
+    "ai-agents",
+    "evals",
+    "simulation",
+    "tau-bench",
+    "pass^k",
+    "llm-testing",
+    "agent-testing",
+    "forward-deployed-engineering"
+  ],
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.135.0",
+    "commander": "^14.0.3",
+    "yaml": "^2.9.1",
+    "zod": "^4.6.7"
+  },
+  "peerDependencies": {
+    "@anthropic-ai/bedrock-sdk": ">=0.35.0",
+    "@aws-sdk/client-bedrock-runtime": ">=3.797.0"
+  },
+  "peerDependenciesMeta": {
+    "@anthropic-ai/bedrock-sdk": {
+      "optional": true
+    },
+    "@aws-sdk/client-bedrock-runtime": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@anthropic-ai/bedrock-sdk": "^0.35.0",
+    "@aws-sdk/client-bedrock-runtime": "^3.1152.0",
+    "@aws-sdk/credential-providers": "^3.1152.0",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^5.0.5"
+  }
+}

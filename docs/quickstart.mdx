@@ -1,0 +1,196 @@
+---
+title: "Quickstart: rehearse your first AI agent in five minutes"
+sidebarTitle: "Quickstart"
+description: "Install sandtable, run the offline freight demo with no API key, rerun it with Claude on both sides, then point it at your own agent over HTTP."
+keywords: ["install", "npx sandtable-ai", "uvx sandtable-ai", "sandtable demo", "getting started", "offline demo"]
+---
+
+In about five minutes: an offline demo with no API key, the same example with Claude playing both sides, and the example run against an agent of your own.
+
+## Install
+
+<Tabs>
+  <Tab title="npm">
+    Needs Node 20 or later.
+
+    ```bash
+    npx sandtable-ai --help
+    # or pin it in a project, and npx runs that copy
+    npm install --save-dev sandtable-ai
+    npx sandtable-ai --help
+    ```
+
+    These docs run the CLI as `npx sandtable-ai <command>`, which uses the copy installed in the project when there is one. Keep the `-ai`: npm has an unrelated package called `sandtable`, and without the suffix npx downloads and runs that package whenever `sandtable-ai` isn't installed in the project.
+  </Tab>
+  <Tab title="Python launcher">
+    Installs a `sandtable` command that runs the matching CLI release. Needs Node 20 or later.
+
+    ```bash
+    uvx sandtable-ai --help
+    # or
+    pip install sandtable-ai && sandtable --help
+    ```
+
+    The `npx sandtable-ai <command>` lines in these docs work as written, since the launcher needs Node too. To go through the launcher, run `uvx sandtable-ai <command>` instead, or `sandtable <command>` after `pip install`. Keep the `-ai` with uvx and pip: PyPI's `sandtable` is an unrelated package.
+  </Tab>
+  <Tab title="From source">
+    For contributors. Needs Node 22.18 or later, which runs the TypeScript sources directly.
+
+    ```bash
+    git clone https://github.com/sandtable-ai/sandtable.git
+    cd sandtable
+    npm install
+    npm run sandtable -- --help
+    ```
+
+    Where these docs write `npx sandtable-ai <command>`, run `npm run sandtable -- <command>`.
+  </Tab>
+</Tabs>
+
+## Run it
+
+<Steps>
+  <Step title="Run the offline demo">
+    ```bash
+    npx sandtable-ai demo
+    ```
+
+    Two rule-based agents replay 50 scripted carrier calls against a fictional freight brokerage. The **naive** agent books whatever it is asked to and scores pass^1 10.0% (5 of 50), with its rule breaks grouped under "Top failure modes". The **careful** agent verifies carriers, respects the rate ceiling and hands off when it should, and scores 100%.
+
+    Each run writes `results.json` and `report.html` under `.sandtable/runs/` and opens the first report in your browser. Pass `--no-open` to skip that.
+  </Step>
+  <Step title="Read the report">
+    The HTML report is one self-contained file. For every task it shows each trial's transcript, the tool calls with their arguments and results, every check that passed or failed, and the changes the agent made to the world. Read a failing trial before trusting any score: it tells you whether the agent, the task or the simulated caller was wrong.
+  </Step>
+  <Step title="Run it with Claude">
+    Claude plays both the carrier and the agent, two trials per task by default. Claude Haiku 5.5 plays the carrier unless `--user-model` names another model, and the agent runs on Claude Opus 5.5 unless `--agent-model` does.
+
+    <Tabs>
+      <Tab title="Anthropic API">
+        ```bash
+        export ANTHROPIC_API_KEY=...
+        npx sandtable-ai demo --live
+        ```
+      </Tab>
+      <Tab title="Amazon Bedrock">
+        ```bash
+        npm install --save-dev sandtable-ai @anthropic-ai/bedrock-sdk
+        npx sandtable-ai demo --live --provider bedrock --region eu-west-1
+        ```
+        Uses your AWS credentials (`--aws-profile` or the default chain). The Bedrock client is an optional package, so it goes next to `sandtable-ai`. See [Run against your agent](/guides/bring-your-agent#claude-on-amazon-bedrock).
+      </Tab>
+    </Tabs>
+
+    The cheaper caller model keeps the cost down. The run holds one conversation per task and trial (`-k`, default 2), so its cost grows with both. For scale: on the example's first 10 tasks, 20 trials, Claude Opus 5.5 as the agent and Claude Haiku 5.5 as the caller cost about $0.58 at list prices ([results](/results)). The full example has more tasks and costs proportionally more.
+  </Step>
+  <Step title="Point it at your own agent">
+    Any agent that answers one POST per step can be rehearsed. Here is a toy one that only verifies the caller's MC number, and remembers the verified carrier for the rest of the call under the `session_id` sandtable sends with every step:
+
+    <CodeGroup>
+    ```js agent-server.mjs
+    // A toy agent that speaks sandtable's HTTP step protocol. Replace decide() with your agent.
+    import { createServer } from "node:http";
+
+    // What the agent remembers about each conversation, keyed by step.session_id: one per trial.
+    const sessions = new Map();
+
+    function decide(step) {
+      const session = sessions.get(step.session_id) ?? {};
+      sessions.set(step.session_id, session);
+      if (step.message !== undefined) {
+        // A new user turn. A real agent appends it to the history it keeps for the session.
+        if (session.carrier) return { reply: `You're already verified, ${session.carrier}. A rep will finish the booking with you.` };
+        const mc = /\bMC\s*#?\s*(\d{5,7})/i.exec(step.message)?.[1];
+        if (!mc) return { reply: "Thanks for calling. What's your MC number?" };
+        return { tool_calls: [{ id: "c1", name: "verify_carrier", arguments: { mc_number: mc } }] };
+      }
+      // Results of the tool calls this agent asked for in its previous response.
+      const [result] = step.tool_results;
+      if (!result.ok) return { reply: "I couldn't find that MC number. Could you check it?" };
+      session.carrier = result.result.name;
+      return { reply: `Thanks, ${session.carrier}, you're verified. Let me get a rep to finish the booking.` };
+    }
+
+    createServer(async (req, res) => {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify(decide(JSON.parse(body))));
+    }).listen(8787, () => console.log("agent listening on http://localhost:8787/step"));
+    ```
+
+    ```python agent_server.py
+    # A toy agent that speaks sandtable's HTTP step protocol. Replace decide() with your agent.
+    import json
+    import re
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    # What the agent remembers about each conversation, keyed by step["session_id"]: one per trial.
+    sessions = {}
+
+
+    def decide(step):
+        session = sessions.setdefault(step["session_id"], {})
+        if "message" in step:
+            # A new user turn. A real agent appends it to the history it keeps for the session.
+            if "carrier" in session:
+                return {"reply": f"You're already verified, {session['carrier']}. A rep will finish the booking with you."}
+            m = re.search(r"\bMC\s*#?\s*(\d{5,7})", step["message"], re.I)
+            if not m:
+                return {"reply": "Thanks for calling. What's your MC number?"}
+            return {"tool_calls": [{"id": "c1", "name": "verify_carrier", "arguments": {"mc_number": m.group(1)}}]}
+        # Results of the tool calls this agent asked for in its previous response.
+        result = step["tool_results"][0]
+        if not result["ok"]:
+            return {"reply": "I couldn't find that MC number. Could you check it?"}
+        session["carrier"] = result["result"]["name"]
+        return {"reply": f"Thanks, {session['carrier']}, you're verified. Let me get a rep to finish the booking."}
+
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            step = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            body = json.dumps(decide(step)).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+
+    ThreadingHTTPServer(("127.0.0.1", 8787), Handler).serve_forever()
+    ```
+    </CodeGroup>
+
+    Start it in one terminal, then run the freight example against it in another:
+
+    ```bash
+    node agent-server.mjs        # or: python3 agent_server.py
+    npx sandtable-ai run examples/freight --agent http://localhost:8787/step --user scripted
+    ```
+
+    It scores pass^1 36.0% (18 of 50). It never books a load, so it passes only tasks where the right outcome is to book nothing. The [noop baseline](/concepts/baselines), an agent that never calls a tool, scores 32.0% (16 of 50) for the same reason. The toy agent passes two more tasks than noop, `double-brokering-on-yes` and `broker-claims-carrier`: in both, the agent must look the carrier up with `verify_carrier` and then book nothing, and the toy agent does look it up. The noop score is the floor of a suite, and the first number to know about it.
+
+    `examples/freight` works from any directory: when there is no such folder where you run the command, sandtable uses the copy bundled with the package and prints its path.
+  </Step>
+</Steps>
+
+## Next
+
+<Columns cols={2}>
+  <Card title="How it works" icon="diagram-project" href="/how-it-works">
+    Worlds, tools, invariants, tasks and grading in one page.
+  </Card>
+  <Card title="Run against your agent" icon="plug" href="/guides/bring-your-agent">
+    Claude, Bedrock, OpenAI-compatible, HTTP and JS/TS module adapters in detail.
+  </Card>
+  <Card title="Draft a domain with init" icon="wand-magic-sparkles" href="/guides/init">
+    Build a domain for your own customer from their documents.
+  </Card>
+  <Card title="Use it in CI" icon="code-branch" href="/guides/ci">
+    Gate pull requests on pass^k.
+  </Card>
+  <Card title="Use it from Claude Code" icon="terminal" href="/guides/claude-code-plugin">
+    Install the plugin and let your coding agent draft, lint and run a domain.
+  </Card>
+</Columns>

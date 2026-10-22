@@ -1,0 +1,180 @@
+---
+title: "Test AI agents in CI: gate pull requests on pass^k"
+sidebarTitle: "Use it in CI"
+description: "Gate pull requests on agent reliability: free offline checks on every change, and a model-backed rehearsal that fails the build below a pass^k threshold."
+keywords: ["continuous integration", "GitHub Actions", "--fail-under", "--baseline", "regression testing", "exit codes", "prompt changes"]
+---
+
+The goal is simple: a prompt tweak, model swap or tool change that breaks a customer rule should fail the build, the same way a broken unit test does. `sandtable` gives you two tiers for that.
+
+| Tier | Commands | Cost | Run it |
+|---|---|---|---|
+| Checks | `validate --strict`, `lint` | free, no model calls, no secrets | on every pull request |
+| Rehearsal | `run -k <n> --fail-under <pct>` | model calls for the agent and the simulated user | on pull requests that touch the agent, or nightly |
+
+## Exit codes
+
+Every command exits with a status a CI step can act on, as `grep` and `diff` do: `0` when it did its job and every gate passed, `1` when a gate failed, and `2` when it couldn't do its job. A red build from `1` is for the agent or the domain to fix. One from `2` is for the pipeline: credentials, a path, an agent that isn't running.
+
+| Status | Command | When |
+|---|---|---|
+| `1` | `run --fail-under <pct>` | pass^k, with k = `--trials`, is below `pct` |
+| `1` | `run` | any trial of a task marked [`critical: true`](/reference/spec#critical-tasks) failed, whatever the score. This holds without `--fail-under` too, and the output names each such task |
+| `1` | `validate`, `lint` | the domain exists but is invalid: a schema, cross-reference or YAML error |
+| `1` | `validate --strict` | a drafted item is still `review: pending` |
+| `1` | `lint` | any task is not graded, not ready, vacuous or not solvable |
+| `2` | `run` | any trial was skipped: it ended in an error (throttling or a timeout that outlasted the retries, an agent endpoint that went down) before the agent broke a rule, so the run is incomplete. This holds without `--fail-under` too, and wins over a failed gate |
+| `2` | `run`, `demo --live` | the agent or the simulated user can't start, checked before the first trial, so nothing runs or is written: missing credentials, a missing optional package, no AWS region for a `bedrock:` agent, or nothing listening at an HTTP agent's URL |
+| `2` | `run`, `demo --live` | every trial ended in an error, so nothing was graded: an agent that fails on every call, or credentials the provider rejects partway |
+| `2` | `leaderboard` | every model is an error row, so the board ranks none of them: its agent couldn't be built, or any of its trials crashed (missing credentials or package, the wrong provider or region, throttling, an agent that isn't running). The do-nothing baseline doesn't count |
+| `2` | any command | a usage error (an unknown command or option, a missing argument, an invalid value), a missing or unreadable file, no domain at the path, an invalid domain for any command but `validate` and `lint`, an adapter that can't be built, or another error that stops it |
+
+In `run`, a trial that ends in an error is skipped, not failed, unless the agent had already broken a hard invariant or called a tool it must not call: an outage is not the agent's failure, but a crash can't hide what it broke first. Skipped trials are left out of pass^k, which `--fail-under` judges, and listed under **Skipped trials** with their error. The run exits 2, since its score rests on fewer trials than you asked for: rerun it, and if one host keeps throttling, lower `--concurrency`. When a gate failed too, the output says so, and the status is still 2. In `leaderboard`, any crashed trial turns that model into an error row instead of a score, and the board exits 2 only when every model is one. A skipped trial of a critical task is not a critical failure.
+
+A step that treats any non-zero status as a failure needs nothing more. To let a failed gate through while an error still stops the job, as a step that renders a report for a failing agent does, accept only `1`: `npx sandtable-ai run ... || [ $? -eq 1 ]`.
+
+Don't pipe a gate's output into `head`: a command whose reader stops early stops there without finishing and exits 141, as Unix tools do. Under `set -o pipefail` the step then fails; without it, a pipeline's status is its last command's, so the gate's result is lost. To keep a log, use `tee`, which reads to the end.
+
+## A GitHub Actions workflow
+
+This assumes the domain lives in `./sandtable`, `sandtable-ai` is pinned in your `devDependencies`, and your agent can be started as a local service on port 8787.
+
+```yaml .github/workflows/sandtable.yml
+name: sandtable
+on:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx sandtable-ai validate ./sandtable --strict
+      - run: npx sandtable-ai lint ./sandtable
+
+  rehearse:
+    needs: checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Start the agent under test
+        run: |
+          node agent-server.mjs &   # your agent, listening on :8787
+          sleep 3                   # or poll your agent's health endpoint
+      - name: Rehearse
+        run: >
+          npx sandtable-ai run ./sandtable
+          --agent http://localhost:8787/step
+          --user claude:claude-haiku-5-5
+          -k 3 --fail-under 85
+          --out .sandtable/ci
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sandtable-report
+          path: .sandtable/ci
+```
+
+The uploaded artifact holds `report.html` and `results.json`, so a reviewer can open the failing transcripts from the pull request.
+
+<Note>
+Until sandtable reaches 1.0, pin an exact version of `sandtable-ai` in `package.json` (for example `npm install --save-dev --save-exact sandtable-ai`): the spec and outputs may change between releases.
+</Note>
+
+### Other agent setups
+
+<Tabs>
+  <Tab title="JS/TS module">
+    ```yaml
+    - run: npx sandtable-ai run ./sandtable --agent ./agent.ts -k 3 --fail-under 85
+      env:
+        ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    ```
+    A `.ts` agent module needs Node 22.18 or later on the runner.
+  </Tab>
+  <Tab title="Claude on Bedrock">
+    ```yaml
+    - uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+        aws-region: eu-west-1
+    - run: npm install --no-save @anthropic-ai/bedrock-sdk
+    - run: npx sandtable-ai run ./sandtable --provider bedrock --agent claude -k 3 --fail-under 85
+    ```
+    `--provider bedrock` applies to the simulated user too, so no Anthropic API key is needed.
+  </Tab>
+  <Tab title="OpenAI-compatible">
+    ```yaml
+    - run: >
+        npx sandtable-ai run ./sandtable --agent openai:gpt-4.1-mini
+        --user claude:claude-haiku-5-5 -k 3 --fail-under 85
+      env:
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    ```
+  </Tab>
+</Tabs>
+
+## Compare with the last run on main
+
+`--fail-under` says whether this run is good enough. `--baseline` says what changed: it compares the run with an earlier `results.json` of the same domain and lists the tasks that broke or got fixed, new failures first, with pass^1 and pass^k before and after ([details](/reference/cli#compare-with-a-baseline)). The report shows the same changes at the top, so a reviewer opening the artifact sees the regressions first.
+
+Keep the last good run on `main` as the baseline. One way is to run the same job on pushes to `main` too, and on a pull request, download the newest artifact from `main` before rehearsing:
+
+```yaml
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  actions: read   # gh run download reads artifacts of other runs
+
+# in the rehearse job, before the Rehearse step:
+      - name: Fetch the baseline from main
+        if: github.event_name == 'pull_request'
+        run: |
+          run_id=$(gh run list --workflow sandtable.yml --branch main --event push --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          [ -n "$run_id" ] && gh run download "$run_id" --name sandtable-report --dir .sandtable/baseline || echo "no baseline yet"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Rehearse
+        run: |
+          baseline=()
+          [ -f .sandtable/baseline/results.json ] && baseline=(--baseline .sandtable/baseline/results.json)
+          npx sandtable-ai run ./sandtable --agent http://localhost:8787/step \
+            --user claude:claude-haiku-5-5 -k 3 --fail-under 85 --out .sandtable/ci "${baseline[@]}"
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+```
+
+The first pull request, before `main` has a run, rehearses without a baseline. Compare like with like: keep the simulated user and k the same as on `main`, since the comparison names any difference but can't take it out of the numbers. The comparison never changes the exit code.
+
+## Choosing the threshold and k
+
+- **Measure first.** Run the suite a few times on `main` and set `--fail-under` a little below what the current agent reliably scores. Raise it as the agent improves.
+- **Know the floor.** Run the [noop baseline](/concepts/baselines) once. A threshold close to the noop score gates nothing.
+- **Use k of 3 or 4 on pull requests.** It catches tasks that fail one time in three. Raising k with the same threshold makes the gate stricter. See [choosing k](/concepts/pass-k#choosing-k).
+- **Keep the simulated user fixed and cheap.** `--user claude:claude-haiku-5-5` keeps cost down, and a fixed caller means a score change comes from the agent.
+- **Expect noise on small suites.** With 10 tasks, one flaky task moves the score by up to 10 points.
+
+## Cost
+
+Each run costs tasks × k conversations. For scale: the first 10 tasks of the bundled freight example, 2 trials each, with Claude Opus 5.5 as the agent and Claude Haiku 5.5 as the caller, cost about $0.58 at list prices ([results](/results)). The terminal summary and report show an estimated cost for Claude models, and for any other model whose prices you pass with `--prices`; without a price, cost shows `n/a`.
+
+## Coming next
+
+Posting the changes since the baseline as a pull request comment is planned ([#13](https://github.com/sandtable-ai/sandtable/issues/13)), as are critical tasks that fail the build on their own ([#28](https://github.com/sandtable-ai/sandtable/issues/28)).

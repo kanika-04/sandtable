@@ -1,0 +1,316 @@
+---
+title: "CLI reference: every sandtable command and flag"
+sidebarTitle: "CLI"
+description: "Every sandtable command and flag (init, validate, lint, review, run, leaderboard, demo, report and regrade) with provider options, environment variables and exit codes."
+keywords: ["command line", "sandtable run", "flags", "options", "environment variables", "exit codes", "leaderboard", "regrade"]
+---
+
+```text
+npx sandtable-ai <command> [options]
+```
+
+| Command | What it does |
+|---|---|
+| [`init`](#init) | draft a domain from a customer's artifacts |
+| [`validate`](#validate) | check a domain for schema and cross-reference errors |
+| [`lint`](#lint) | prove every task is ready, solvable, non-vacuous and graded, without model calls |
+| [`review`](#review) | list drafted items that still need a person to accept them |
+| [`run`](#run) | run every task k times against an agent and grade the results |
+| [`leaderboard`](#leaderboard) | rank several agents on one domain under the same simulated users, next to a do-nothing baseline |
+| [`demo`](#demo) | rehearse the bundled freight example |
+| [`report`](#report) | re-render the HTML report for a past run |
+| [`regrade`](#regrade) | re-score a past run's stored trials under the domain's current rules, without calling a model |
+
+`npx sandtable-ai --version` prints the version and `npx sandtable-ai <command> --help` lists a command's options. From a clone of the repo, run `npm run sandtable -- <command>`.
+
+`validate`, `lint`, `review`, `run` and `leaderboard` accept `examples/freight` and `examples/clinic` outside a clone too. When the current directory has no folder of that name, they use the copy bundled with the package and print its path on stderr. A folder of that name in the current directory always wins, and any other path is used as given.
+
+## init
+
+Draft a domain from a customer's artifacts. Review the output before trusting it. See [Draft a domain with init](/guides/init).
+
+```bash
+npx sandtable-ai init --openapi api.yaml --sop policy.md --transcripts calls/ -o sandtable
+```
+
+| Option | Description |
+|---|---|
+| `--openapi <file>` | OpenAPI 3.x spec (YAML or JSON): drafts tables and tools, no model needed |
+| `--sop <file>` | SOP or policy document: drafts invariants with Claude, each quoting its source |
+| `--transcripts <path>` | call or chat transcripts (a file, or a directory of `.txt`/`.md` files): drafts personas and tasks with Claude |
+| `-o, --out <dir>` | domain directory to create, or to add to when it already exists. Default: `sandtable` |
+| `-m, --model <id>` | Claude model for the drafting steps. Default: `claude-opus-5-5` |
+| `--force` | overwrite existing files when drafting from `--openapi` |
+| `--provider`, `--region`, `--aws-profile` | where Claude runs; see [provider options](#provider-options) |
+
+At least one of `--openapi`, `--sop` and `--transcripts` is required. They run in that order. Without `--force`, `--openapi` refuses to overwrite existing files. After `--sop` and after `--transcripts`, `init` prints the step's token usage per model and an estimated cost: one call for the SOP, one per transcript.
+
+## validate
+
+Check a domain for schema and cross-reference errors.
+
+```bash
+npx sandtable-ai validate ./my-domain [--strict]
+```
+
+| Argument / option | Description |
+|---|---|
+| `<domain>` | domain directory (with `sandtable.yaml`) or the file itself |
+| `--strict` | also fail while drafted items are pending review |
+
+```text
+✓ freight-carrier-sales: 8 tables, 9 tools, 18 invariants, 50 tasks
+```
+
+A `⚠` line is a warning, not an error, and never fails `validate`, not even with `--strict`. It flags a `never_disclose` field that no tool returns and the policy doesn't state, which can never fire, since a value counts only once the agent has been shown it.
+
+## lint
+
+Prove every task is ready, solvable, non-vacuous and graded, without any model call. See [The noop baseline and lint](/concepts/baselines).
+
+```bash
+npx sandtable-ai lint ./my-domain
+```
+
+| Argument | Description |
+|---|---|
+| `<domain>` | domain directory (with `sandtable.yaml`) or the file itself |
+
+Each task prints as `✓` (clean), `!` (warnings) or `✗` (errors), followed by whether it expects a write, is ready, is solvable (`solvable ?` when it has no `reference`), and whether the noop baseline passes it.
+
+## review
+
+List drafted items that still need a person to accept them. See [Review workflow](/concepts/review-workflow).
+
+```bash
+npx sandtable-ai review ./my-domain
+```
+
+| Argument | Description |
+|---|---|
+| `<domain>` | domain directory (with `sandtable.yaml`) or the file itself |
+
+## run
+
+Run every task k times against an agent and grade the results.
+
+```bash
+npx sandtable-ai run ./my-domain --agent http://localhost:8787/step -k 4 --fail-under 85
+```
+
+| Argument / option | Description |
+|---|---|
+| `<domain>` | domain directory (with `sandtable.yaml`) or the file itself |
+| `-a, --agent <spec>` | the agent under test; see below. Default: `claude` |
+| `-u, --user <spec>` | the simulated user: `claude`, `claude:<model>`, `openai:<model>` or `scripted`. Default: `claude` |
+| `--openai-base-url <url>` | OpenAI-compatible endpoint for `openai:<model>`. Default: `OPENAI_BASE_URL`, else `https://api.openai.com/v1`; the key comes from `OPENAI_API_KEY` |
+| `-k, --trials <n>` | trials per task; pass^k is reported for every k up to n. Default: `1` |
+| `-t, --tasks <ids>` | comma-separated task ids to run (all by default) |
+| `-c, --concurrency <n>` | episodes run in parallel. Default: `4` |
+| `-o, --out <dir>` | output directory for `results.json` and `report.html`. Default: `.sandtable/runs/<timestamp>-<domain>` |
+| `--no-html` | skip the HTML report |
+| `--fail-under <pct>` | exit 1 if pass^k (k = `--trials`) is below this percentage, `0` to `100`. A trailing `%` is accepted |
+| `--baseline <results>` | a previous run's `results.json`: also show which tasks broke or got fixed since, and how pass^k moved. See [compare with a baseline](#compare-with-a-baseline) |
+| `--open` | open the HTML report in the browser when the run finishes |
+| `--prices <file>` | extra model prices for the cost estimate: `{ "<model-id>": { "input", "output", "cacheRead", "cacheWrite" } }` in USD per million tokens. For Bedrock, [`scripts/bedrock-prices.mjs`](https://github.com/sandtable-ai/sandtable/blob/main/scripts/bedrock-prices.mjs) in the repo writes this file from the AWS Pricing API, and with `--verified` takes the models it doesn't list from [`prices/bedrock.verified.json`](https://github.com/sandtable-ai/sandtable/blob/main/prices/bedrock.verified.json), prices copied from AWS's model pages with their source |
+| `--provider`, `--region`, `--aws-profile` | where Claude runs, and the AWS settings for `bedrock:<model-id>`; see [provider options](#provider-options) |
+
+`--agent` accepts:
+
+| Spec | Agent |
+|---|---|
+| `claude`, `claude:<model>` | the Claude reference agent |
+| `bedrock:<model-id>` | any tool-capable model on Amazon Bedrock, through the Converse API |
+| `openai:<model>` | any model behind an OpenAI-compatible Chat Completions endpoint |
+| `http://…`, `https://…` | your agent, over the [HTTP step protocol](/reference/http-protocol) |
+| a file path | a JS/TS module that default-exports an `AgentAdapter`, or a function returning one |
+| `noop` | the do-nothing baseline |
+| `scripted:naive`, `scripted:careful` | rule-based demo agents for the bundled freight example |
+| `scripted:clinic-naive`, `scripted:clinic-careful` | rule-based demo agents for the bundled clinic example |
+
+[Run against your agent](/guides/bring-your-agent) explains each adapter and the packages and credentials it needs.
+
+Before the first trial, `run` checks that the agent and the simulated user can start, without spending anything: Claude on the Anthropic API lists one model, Claude on Bedrock and `bedrock:` agents resolve their AWS credentials (and a `bedrock:` agent its region) and the optional package they need, and an `http(s)://` agent accepts a connection (no request is sent). When one can't, `run` names the role and the problem, runs nothing, writes nothing and exits 2. `openai:` specs already fail without `OPENAI_API_KEY`, and scripted, `noop` and module agents need no check. `demo --live` checks the same.
+
+The run prints a summary (per-task results, pass^k, latency, cost, per-tag scores, the rate of each soft invariant and the top failure modes) and the paths of the files it wrote. See [results.json](/reference/results-schema).
+
+[Critical tasks](/reference/spec#critical-tasks) are listed first and marked `critical`, with a line such as `critical 2 of 3 passed every trial` under pass^k. When any trial of a critical task fails, `run` names those tasks and exits 1, with or without `--fail-under`. When both fail, it prints both.
+
+Each task row shows one mark per trial, `✓` passed, `✗` failed or `○` skipped, then passes out of graded trials, and `flaky` when some graded trials passed and others failed. With k > 1, the headline adds pass@k and the flip rate (the share of tasks with two or more graded trials that are flaky), and **Flaky tasks** lists those tasks with a 95% interval for each one's pass rate. A trial that ended in an error before the agent broke a rule is skipped: left out of pass^k and pass@k, and listed under **Skipped trials** with its error. A run with any skipped trial exits 2, since it is incomplete; see [pass^k and reliability](/concepts/pass-k#skipped-trials).
+
+### Compare with a baseline
+
+`--baseline` compares the run with an earlier run of the same domain, such as the last run on `main`, and answers "what changed?" task by task:
+
+```bash
+npx sandtable-ai run ./my-domain --agent http://localhost:8787/step -k 4 --baseline main-run/results.json
+```
+
+```text
+  Compared with main-run/results.json
+  run 20261021T101544-p2qd · started 2026-10-21T10:15:44.120Z
+  ! how it's graded changed for 1 task
+
+  ✗ broken  expired-insurance         4/4 → 2/4
+  ↓ worse   negotiate-two-rounds      3/4 → 1/4
+  ✓ fixed   walk-away-above-ceiling   2/4 → 4/4
+  ~ changed rep-confirm-and-instant   1/4 → 4/4  grading
+  ~ changed: its prompts, tools, world or grading differ from the baseline's
+  = 46 unchanged
+
+  over the 49 tasks both runs ran with the same test (1 changed left out):
+  pass^1 87.0% → 86.0%  (−1.0 pts)
+  pass^4 76.0% → 76.0%  (no change)
+```
+
+pass^4 didn't move here, because one task broke as another was fixed: the task lines are what show the regression. `rep-confirm-and-instant` passes now because its expectations were edited, so it isn't credited as fixed.
+
+Each task that ran in both, with the same test, is `broken` (it passed every trial before and fails one now), `worse` (fewer of its trials pass, without crossing passing every trial), `fixed`, `better` or unchanged, counting graded trials only. A task that one of the runs graded no trial of, because each was [skipped](/concepts/pass-k#skipped-trials), is listed as not graded instead. New failures come first. Added tasks, and tasks only the baseline ran (removed from the domain, or left out with `--tasks`), are counted on a line each, with the failing added tasks named first. pass^1 and pass^k are compared over the tasks both runs ran with the same test, up to the smaller of the two k. Under the baseline's run id, a `!` line names each other difference: the agent, the simulated user, k, and how many tasks' tests changed.
+
+A task's test is `changed` when its per-task hashes in `results.json` differ from the baseline's: `inputs`, what the agent and the caller are given and the world they act in (the policy, every tool's definition, the caller's prompt, opening and turn limit, the script for `--user scripted`, and the seed rows with the task's `given.rows`), or `grading`, how its trials are graded (its `expect` and `critical`, and every invariant with its `soft` flag, since a call to any tool can trip one). Its result is shown, but it isn't counted as fixed or broken, and it's left out of pass^k: the move may come from the edit, not the agent. Seed rows, tools and invariants are shared, so editing one marks every task changed. Accepting a drafted item (its `review`) changes neither hash. To compare like with like after changing how tasks are graded, regrade the baseline under the edited domain first (`regrade main-run/results.json -d ./my-domain -o main-regraded`) and pass that as `--baseline`. A baseline written before these hashes (by 0.1.x) can't show which tests changed, and the comparison says so in a `!` line.
+
+The baseline is read before any trial runs, so a missing file, a file that isn't a `results.json`, or a run of another domain stops the run before it calls a model. The comparison never changes the exit code: `--fail-under` still gates on this run's pass^k alone.
+
+`results.json` keeps what it needs of the baseline as [`baseline`](/reference/results-schema#baselinesnapshot), and the HTML report opens with the changes, regressions first, and marks each task that got worse. [`report`](#report) and [`regrade`](#regrade) show them again without the baseline's file.
+
+## leaderboard
+
+Rank several agents on one domain under the same simulated users, next to a do-nothing baseline.
+
+```bash
+npx sandtable-ai leaderboard examples/freight -m models.yaml -k 4 \
+  --provider bedrock --region eu-west-1 --prices bedrock-prices.json
+```
+
+The models file (`models.yaml` above) lists the agents, with an optional shared caller and k:
+
+```yaml
+user: claude:claude-sonnet-5-5   # every model faces the same simulated callers
+k: 4
+models:
+  - { label: Claude Opus 5.5, agent: claude:claude-opus-5-5 }
+  - { label: GPT-6.1 Sol, agent: bedrock:global.openai.gpt-6.1-sol }
+```
+
+The repo has the freight leaderboard's own, [`leaderboard/models.yaml`](https://github.com/sandtable-ai/sandtable/blob/main/leaderboard/models.yaml), and the Bedrock prices it runs with, [`prices/bedrock.eu-west-1.json`](https://github.com/sandtable-ai/sandtable/blob/main/prices/bedrock.eu-west-1.json).
+
+| Argument / option | Description |
+|---|---|
+| `<domain>` | domain directory (with `sandtable.yaml`) or the file itself |
+| `-m, --models <file>` | **required**: the models file, YAML: `{ user?, k?, models: [{ label, agent, effort? }] }`; `agent` takes the same specs as `run --agent`; `effort` (`low`, `medium`, `high`, `xhigh` or `max`) is for `claude:` agents only |
+| `-u, --user <spec>` | simulated user for every model; overrides the models file. Default: `claude` |
+| `-k, --trials <n>` | trials per task; overrides the models file. Default: `4` |
+| `-t, --tasks <ids>` | comma-separated task ids to run, for every model and the baseline. Default: all tasks |
+| `-c, --concurrency <n>` | episodes in parallel per model. Default: `4` |
+| `--openai-base-url <url>` | OpenAI-compatible endpoint for `openai:<model>` entries |
+| `-o, --out <dir>` | output directory. Default: `leaderboard/<domain name>` |
+| `--no-resume` | rerun every model and replace its stored results |
+| `--prices <file>` | extra model prices for the cost column |
+| `--provider`, `--region`, `--aws-profile` | see [provider options](#provider-options) |
+
+Each model's full `results.json` and `report.html` go in their own folder, named after its label (`Claude Opus 5.5` → `claude-opus-5-5/`). Two labels that make the same folder name are refused before anything runs. `leaderboard.json`, `LEADERBOARD.md` and `leaderboard.html` rank them by pass^k, with pass^1, rule violations, the top failure, cost per trial and p95 turn latency. When the domain has soft invariants, a **Soft rules** column shows how often each model broke each one, such as `counter-at-ceiling 37.5% (3/8)`; it never affects the ranking. Cost per trial counts the agent's model only, since every model faces the same caller; `leaderboard.json` also has the total with the caller (`costUsd`, `costPerTrialUsd`). The do-nothing baseline is always added, so a `noop` entry in the models file is skipped.
+
+A model's existing results are reused when they match the run: the same agent spec, domain name, k, simulated caller and tasks, with no crashed trial, and the agent and the caller given the same inputs (the policy, the tools, the seed records and each task's caller instructions, which `results.json` keeps as an `inputs` hash). Each model's folder keeps the agent spec in `run.json` for this check. An interrupted or paid run then resumes instead of repeating work: models with matching results are reused, and models with none run. Stored results that don't match, or have no `run.json`, are never replaced, since they may be the only copy of paid conversations. The board stops before it runs anything and lists each model whose results it would replace, with why (for example `they are for k=4, not k=1`). Run a check of a few tasks, another k or another caller with another `-o`. To rerun a model, delete or move its folder first; `--no-resume` reruns every model and replaces all their results. Reused results are never ranked on the verdicts they were stored with: their conversations are graded again under the domain's current rules, as [`regrade`](#regrade) does, without calling a model. An edit to an invariant or an expectation then updates every model's `results.json` and `report.html`, and the output says how many verdicts changed. A model with crashed trials (expired credentials, throttling that outlasted the retries) shows as an error instead of a score, and the next run retries it unless it has stored results to reuse. So does the do-nothing baseline when the caller it runs under crashes. When every model shows as an error, because its agent couldn't be built or any of its trials crashed, `leaderboard` still writes the board, then points at the `✗ failed` lines that give each model's error, and exits 1, so a CI job that runs it fails. One model with a score is enough for exit 0, and the baseline doesn't count; a models file of `noop` entries only, which leaves just the baseline, also exits 0. Even under `--no-resume`, a run with crashed trials never replaces the model's stored results, which may be the only copy of paid conversations: it is written to a `crashed/` folder inside the model's folder. The model's next run of the same tasks, k and caller replaces that folder if it crashes too, and removes it if it doesn't. A crashed run of other tasks, another k or another caller, such as a full board's under a quick check on the same `-o`, is never removed or replaced: a crashing run goes beside it in `crashed-2/` (then `crashed-3/`…), and the output says which crashed runs it kept, as it does for one whose `results.json` can't be read. While stored results are reused next to crashed runs, the output says where they are, so you can delete them before publishing the folder. Keep the caller fixed and disclose which model plays it, since it may favour its own family.
+
+A `claude:` entry can set `effort`, the Claude agent's reasoning effort: `{ label: Claude Sonnet 5.5, agent: claude:claude-sonnet-5-5, effort: high }`. Without it, a Claude agent runs at `medium`, as in `run`; a Claude caller always runs at `low`. An `effort` on any other agent is an error, since only the Claude agent has the setting. Each Claude model's `run.json` records the effort it ran at, and results stored at another effort aren't reused. A `run.json` from before effort was recorded counts as `medium`. `LEADERBOARD.md` and `leaderboard.html` show each Claude model's effort next to its name, as in `Claude Sonnet 5.5 (effort high)`, and its row in `leaderboard.json` has it as `effort`.
+
+Each model's `run.json` also records what ran its trials: `sandtable` (the `version`, and the git `commit` with `dirty: true` for uncommitted changes, when sandtable runs from its own clone), `provider` when the model or the caller is a Claude model, and `region` when either calls Bedrock. The region is `--region`, else `AWS_REGION` or `AWS_DEFAULT_REGION`, else the region in the AWS profile's config, and the leaderboard sends every Bedrock call there, Claude's included. The commit pins the prompts and the adapter settings, such as the caller's effort, the Claude agent's default effort and `max_tokens`. `leaderboard.json` records the `sandtable` that graded and ranked the rows, and `LEADERBOARD.md` and `leaderboard.html` name its version and commit. With `--prices`, `leaderboard.json` also records `prices: { file, sha256 }`: the file's path relative to the working directory, or only its name when it is outside it, so no home directory is published, and a sha256 of its bytes. Every cost column is priced with that file, reused rows included, so the board can be checked against it. The built-in Claude prices are code, pinned by the commit. A run from a checkout with uncommitted changes prints a warning. Stored results are reused only on the provider and region the model uses now, since price, routing and the served model can differ. Results from another provider or region, or with a `run.json` from before either was recorded, aren't reused, and the output says why (`they ran in eu-west-1, not us-east-1`). A model that uses neither, such as an `openai:` agent with a scripted caller, still reuses its results when they change. When Bedrock is in use and no region comes from `--region`, the environment or the AWS profile, `leaderboard` stops before it runs or rewrites anything.
+
+## demo
+
+Rehearse the bundled freight carrier-sales example.
+
+```bash
+npx sandtable-ai demo                                       # offline: two rule-based agents, no API key
+npx sandtable-ai demo --live                                # Claude plays the caller and the agent
+```
+
+| Option | Description |
+|---|---|
+| `--live` | use Claude as both the agent and the simulated user (needs `ANTHROPIC_API_KEY` or `ant auth login`, or `--provider bedrock`) |
+| `-k, --trials <n>` | trials per task in `--live` mode. Default: `2` |
+| `--agent-model <id>` | model for the agent in `--live` mode |
+| `--user-model <id>` | model for the simulated caller in `--live` mode. Default: `claude-haiku-5-5`, cheaper than the agent's model, which keeps the run cheap |
+| `--no-open` | do not open the HTML report in the browser |
+| `--provider`, `--region`, `--aws-profile` | where Claude runs; see [provider options](#provider-options) |
+
+The offline demo runs the `scripted:naive` and `scripted:careful` agents against scripted callers and writes a report for each. The naive agent's report opens in the browser, and only when the output is a terminal.
+
+## report
+
+Re-render the HTML report for a past run, for example after upgrading sandtable.
+
+```bash
+npx sandtable-ai report .sandtable/runs/<run>/results.json [-o <folder> | -o <file>.html]
+```
+
+| Argument / option | Description |
+|---|---|
+| `<results>` | path to a `results.json` |
+| `-o, --out <path>` | a folder to write `report.html` into, as `run -o` and `regrade -o` take a folder, or a path ending in `.html` for the file itself. A folder that doesn't exist yet is created. Default: `report.html` next to `results.json` |
+
+It prints the path it wrote. A run made with `--baseline` keeps its changes since the baseline, without the baseline's file.
+
+## regrade
+
+Re-score a past run's stored trials after editing how the domain grades them: an invariant, an expectation or a `never_disclose` rule. No model is called, so a fixed grading rule doesn't cost a rerun.
+
+```bash
+npx sandtable-ai regrade .sandtable/runs/<run>/results.json --domain examples/freight
+```
+
+| Argument / option | Description |
+|---|---|
+| `<results>` | path to a `results.json` |
+| `-d, --domain <dir>` | **required**: the domain the run used, as edited since: a directory (with `sandtable.yaml`) or the file itself. `results.json` records only the domain's `name`, not where it is, so there is no default |
+| `-o, --out <dir>` | output directory for `results.json` and `report.html`. Default: the results' own directory, replacing them |
+| `--no-html` | skip the HTML report |
+
+It replays each trial's tool calls in order against a fresh copy of the world, grades the conversation as a live run would, and recomputes every score. The transcripts, token usage and timing stay as they were recorded. It prints the summary, how many verdicts changed and which, and the new pass^k.
+
+It refuses, and writes nothing, when `--domain` is another domain: the `name` in its `sandtable.yaml` isn't the `domain` that `results.json` records. The error names both. Pass the domain the run used. If you renamed the domain since the run, restore its `name` or rerun it with `run`.
+
+It also refuses, and writes nothing, when the stored conversations no longer fit the domain:
+
+- the agent or the caller would be given something else now: the policy, a tool's schema, or a task's caller prompt, opening line or turn limit (and its script, for the scripted caller). `results.json` keeps a hash of them as `inputs`.
+- a tool call would now return something other than what the agent saw, for example after an edit to the seed records or to what a tool does.
+- a task it ran is gone.
+
+Rerun those with `run`. Tasks added since the run, with their seed records, don't block it unless they change what a stored tool call returns.
+
+A run made with `--baseline` is compared with its baseline again after the re-score. The baseline's verdicts stay as its own run recorded them, under the rules of that time.
+
+The hash covers what sandtable's own adapters give a model. A custom agent adapter receives the whole domain, so a field it reads beyond the system prompt and the tool schemas is not covered: after editing one, rerun instead of regrading.
+
+## Provider options
+
+`init`, `run`, `leaderboard` and `demo` accept:
+
+| Option | Description |
+|---|---|
+| `--provider <name>` | where Claude runs: `anthropic` or `bedrock`. Default: `SANDTABLE_PROVIDER`, else `anthropic` |
+| `--region <region>` | AWS region for Bedrock. Default: `AWS_REGION` |
+| `--aws-profile <name>` | AWS profile for Bedrock. Default: `AWS_PROFILE` |
+
+## Environment variables
+
+| Variable | Used for |
+|---|---|
+| `ANTHROPIC_API_KEY` | Claude on the Anthropic API (agent, simulated user, `init`) |
+| `SANDTABLE_PROVIDER` | default for `--provider` |
+| `SANDTABLE_BEDROCK_CLIENT` | `classic` (default: cross-region inference profiles) or `mantle` (Bedrock's Messages-API endpoint) |
+| `AWS_REGION`, `AWS_DEFAULT_REGION` | Bedrock region when `--region` is not given |
+| `AWS_PROFILE` | AWS profile when `--aws-profile` is not given; other standard AWS credential variables also work |
+| `OPENAI_API_KEY` | bearer token for `openai:<model>`; required only for the default OpenAI endpoint |
+| `OPENAI_BASE_URL` | default for `--openai-base-url` |
+
+## Exit codes
+
+As `grep` and `diff` do, a failed gate exits 1 and an error exits 2. See [Use it in CI](/guides/ci#exit-codes) for each case.
+
+| Code | When |
+|---|---|
+| `0` | the command did its job and every gate passed; also `--help` and `--version` |
+| `1` | a gate failed on a complete result: `run` below `--fail-under`, a `run` in which any trial of a critical task failed, `validate` or `lint` on a domain that exists but is invalid, `validate --strict` with pending items, or `lint` errors |
+| `2` | the command couldn't do its job: a usage error (an unknown command or option, a missing argument, an invalid value, or no command at all), a missing or unreadable file, no domain at the path, an invalid domain for any command but `validate` and `lint`, an unknown agent or user spec, missing credentials or package, an agent or simulated user that can't start (checked before a `run` or `demo --live` runs any trial), a `run` with a skipped trial (it ended in an error before the agent broke a rule, so the run is incomplete, even when a gate failed too), a `run` or `demo --live` in which every trial ended in an error, or a `leaderboard` on which every model failed or crashed |
+| `141` | the output was piped into a reader that stopped early, such as `head` or a `less` quit before the end: the command stops there quietly, without finishing, with the status a shell reports for a Unix tool stopped by `SIGPIPE` (128 + 13) |

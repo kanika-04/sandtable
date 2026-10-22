@@ -1,0 +1,290 @@
+---
+title: "Domain spec: every field of sandtable.yaml and tasks.yaml"
+sidebarTitle: "Domain spec"
+description: "Every field of sandtable.yaml and tasks.yaml, the files that define a domain: world tables, tools, where clauses, invariants, personas and tasks."
+keywords: ["YAML schema", "sandtable.yaml", "tasks.yaml", "configuration", "where clauses", "templates"]
+---
+
+A domain lives in a directory with a `sandtable.yaml`. Any top-level value that is a relative path to a `.md`, `.yaml` or `.yml` file is inlined, so you can keep `policy: ./policy.md` and `tasks: ./tasks.yaml` in separate files. A path to a missing file is a validation error, so a misspelled path can't become the policy text.
+
+Run `npx sandtable-ai validate <dir>` after every edit. It checks the schema and every cross-reference (tables, tools, params, personas).
+
+```yaml sandtable.yaml
+name: string                # required
+description: string         # who the agent works for; shown to both agent and simulated user
+policy: string | ./file.md  # required: the SOP the agent must follow (the reference agent's system prompt)
+max_turns: 20               # user turns per trial before it is cut off
+world: { tables: ... }      # required
+tools: [...]                # required, at least one
+invariants: [...]
+personas: [...]
+tasks: [...] | ./tasks.yaml
+```
+
+<Note>
+The schema is strict: an unknown key anywhere is a validation error, not a silent no-op. A typo such as `invariant:` instead of `invariants:` fails `sandtable validate`.
+</Note>
+
+## Templates
+
+Inside tool `ops`, `checks`, invariant `where` clauses and task assertions:
+
+- `"$arg"` is replaced by the tool call's argument value, keeping its type.
+- `"${arg}"` interpolates inside a longer string: `"Load ${load_id} is not available"`.
+- An argument's name is a letter or `_`, then letters, digits or `_`. Any other string is literal text, even when it starts with `$`: `"$5"`, `"$$"`, `"$/hr"`, `"$USD/kg"`, `"$@type"`. A whole string such as `"$USD"` is a reference.
+- In a tool's `ops` and `checks`, every reference must name one of the tool's params, or `sandtable validate` fails with `never resolves: tool "get_load" has no param "loadId"`. It would be empty at run time.
+- A condition whose argument was not passed (an optional param) is dropped, so it filters nothing.
+
+## Where clauses
+
+`where`, `fields`, `when` and the `args` of a task's `called` and `not_called` entries are maps of field to condition. A plain value means equality. An object of operators means all of them must hold:
+
+| Operator | Meaning |
+|---|---|
+| `$eq`, `$ne` | equal / not equal |
+| `$in`, `$nin` | in / not in a list |
+| `$gt`, `$gte`, `$lt`, `$lte` | numeric comparison (strings compare lexically, so ISO dates work) |
+| `$exists` | `true`: the field is set and not null; `false`: it is missing or null |
+| `$contains` | case-insensitive substring |
+
+There are no top-level operators such as `$or`: every field's condition must hold. `validate` fails on an unknown operator, on `$in` or `$nin` without a list (a `"$arg"` reference is a single value, never a list), and on a top-level `$` key, in every where clause, with the clause's path, such as `tools.list_orders.ops[0].where.status: unknown operator "$like"`.
+
+## world
+
+```yaml
+world:
+  tables:
+    loads:
+      key: load_id            # primary key field
+      rows:                   # seed data; each trial starts from a fresh copy
+        - { load_id: L-1001, origin: "Dallas, TX", status: available, max_rate: 2350 }
+    bookings:
+      key: booking_id         # created rows without a key get "<table>-<n>"
+```
+
+Every seed row needs its key field, and keys must be unique within a table.
+
+## tools
+
+A tool is what the agent sees (name, description, JSON-schema params) plus what it does to the world.
+
+```yaml
+- name: book_load                       # ^[a-zA-Z0-9_-]{1,64}$
+  description: What it does, written for a model.
+  params:
+    load_id: { type: string }           # string | number | integer | boolean
+    rate: { type: number, description: "All-in USD" }
+    note: { type: string, required: false }
+    equipment: { type: string, required: false, enum: [dry_van, reefer] }
+    status: { type: string, required: false, default: available }   # used when the agent omits it
+  checks:                               # preconditions the real API enforces; failing one = tool error, no writes
+                                        # (skipped when the key comes from an optional arg that was not passed)
+    - { table: loads, key: $load_id, where: { status: available }, error: "Load ${load_id} is not available" }
+  ops:                                  # run in order, atomically (all or nothing)
+    - create: bookings
+      values: { load_id: $load_id, rate: $rate }
+    - update: loads
+      key: $load_id
+      set: { status: booked }
+  returns: 0                            # which op's result the agent gets back (default 0)
+```
+
+| Op | Effect | Returns |
+|---|---|---|
+| `get: <table>, key` | read one row; error if missing | the row |
+| `list: <table>, where?, limit?` | filter rows | array of rows |
+| `create: <table>, values` | insert a row | the new row |
+| `update: <table>, key, set` | merge fields into a row; error if missing | the updated row |
+| `respond: <value>` | no state change | the value (templated) |
+
+Arguments are validated before anything runs. Unknown argument names, missing required ones and wrong types come back to the agent as tool errors. Representations are coerced leniently: `"2,100"` becomes `2100` for a number param, and `100101` becomes `"100101"` for a string param.
+
+There is no `delete` op, and params are scalars only (no arrays or nested objects yet; see [#26](https://github.com/sandtable-ai/sandtable/issues/26)).
+
+## invariants
+
+Checked before every tool call, against the world as it is at that moment. A violation fails the trial even if the call itself then errors: attempting the forbidden action is the bug. [Invariants vs expectations](/concepts/invariants) explains when to use which.
+
+```yaml
+# `then` only after a successful `first` with the same values for `same`
+- id: verify-before-book
+  description: ...
+  before: { first: verify_carrier, then: book_load, same: [mc_number] }
+
+# the record keyed by an argument must exist and match `where`
+- id: eligible-carrier
+  description: ...
+  require: { tool: book_load, table: carriers, key_arg: mc_number, where: { insurance_status: valid } }
+
+# numeric bound on an argument: a constant or another record's field
+- id: rate-ceiling
+  description: ...
+  limit: { tool: book_load, arg: rate, lte: { table: loads, key_arg: load_id, field: max_rate } }
+
+# soft: checked the same way, reported as a rate, never fails a trial
+- id: counter-at-ceiling
+  description: ...
+  soft: true
+  limit: { tool: log_offer, arg: counter_offer, lt: { table: loads, key_arg: load_id, field: max_rate } }
+
+# two referenced records must agree on a field
+- id: equipment-match
+  description: ...
+  match:
+    tool: book_load
+    left: { table: carriers, key_arg: mc_number, field: equipment }
+    right: { table: loads, key_arg: load_id, field: equipment }
+
+# never call a tool (optionally: never with matching args)
+- id: no-refunds-over-500
+  description: ...
+  never: { tool: issue_refund, when: { amount: { $gt: 500 } } }
+
+# never say a protected value in any agent message (and never next to these words)
+- id: never-disclose-ceiling
+  description: ...
+  never_disclose: { table: loads, field: max_rate, unless: { tool: book_load, arg: rate }, never_with: [max, ceiling] }
+```
+
+| Kind | Checked | Fails when |
+|---|---|---|
+| `before` | on every call to `then` | no earlier successful `first` call with equal values for every arg in `same` |
+| `require` | on every call to `tool` | the row keyed by `key_arg` is missing or does not match `where` |
+| `limit` | on every call to `tool` | `arg` is above `lte`, below `gte`, at or above `lt`, or at or below `gt` (each a number, or a field of the row keyed by `key_arg`) |
+| `match` | on every call to `tool` | `left` and `right` fields differ (skipped if either value is missing) |
+| `never` | on every call to `tool` | always, or when the arguments match `when` |
+| `never_disclose` | on every agent message, after the conversation | a value of `table.field` the agent had been shown appears in what it said, unless an `unless` call carried it in that turn or earlier, or the caller said it first; with `never_with`, also when it is in one sentence with one of those words, allowed or not |
+
+`never_disclose` recognizes the usual spellings of a number (`2350`, `2,350`, `$2,350.00`) without matching identifiers, longer numbers or units (`L-2350`, `12350`, `2350km`). The Unicode hyphens U+2010 and U+2011 read as `-`, so `L‑2350` is an identifier and `555‑0148` matches the value `555-0148`. An en or em dash after a number still ends it (`$2,350—final`). String values shorter than three characters are ignored, and booleans can't be protected. `validate` rejects a `never_disclose` whose field holds booleans, or only strings shorter than three characters, in the seed rows, because it could never fire. `unless` allows a value the agent successfully passed to that tool argument, such as the rate it actually booked. Give a list to allow several, for example the booked and the submitted rate: `unless: [{ tool: book_load, arg: rate }, { tool: submit_offer, arg: rate }]`.
+
+Both exceptions follow the order of the conversation:
+
+- An `unless` call allows its value from the agent turn it was made in. In one turn the agent's tool calls come before its reply, so "Booked at $2,350" passes in the turn that books $2,350. A message that says the value in an earlier turn still fails, even when the agent books it later: "The max we can do is $2,350" followed by a booking at $2,350 is a leak.
+- A value the caller said before the agent did is not a leak when the agent repeats it, such as a caller's ask that happens to equal the ceiling ("Can you do $2,350?" "Yes, $2,350 works"). The caller's words are matched with the same spellings. If the agent says the value first, the caller repeating it doesn't make it the caller's.
+
+A value counts only once the agent has been shown it: a successful tool result earlier in the conversation contained it, in any field or in free text (a row from `get_load`, one of the rows `search_loads` returned), or it is in sandtable's default system prompt (the domain description, the policy and the task's `given.context`). An agent can't leak a value it never saw, so a number that only matches by coincidence is not a leak, such as an offer of $1,050 on one load when $1,050 is the ceiling of a load the agent never looked up. If your agent knows a protected value from its own prompt, put it in the policy, or this check can't fire. `validate` warns when no tool returns the protected table and the policy states none of its values. A value the agent says first, before it was shown, is still its own: a caller repeating it doesn't clear it.
+
+`never_with` lists words that make a value a disclosure wherever it is said, such as the words a policy forbids for a ceiling: `never_with: [max, maximum, ceiling, cap, limit, budget]`. A message that says a shown value in one sentence with one of them fails even where `unless` or the caller allows the value. So "$2,350 is our max" fails after a counter-offer of $2,350 was logged, and so does "Yes, $2,350 is our ceiling" after the caller asked about it. A sentence ends at `.`, `!` or `?` followed by a space, or at a line break, so "$2,350.00. That's our max." is two sentences and passes. Words match whole and in any case, and a phrase such as `top rate` matches across any spaces. A whole word means `cap` doesn't match `capacity` or `capped`, and `limit` doesn't match `limits` or `limited`: list each form yourself. `never_with` belongs to its `never_disclose`, so it can't be soft on its own; `soft: true` applies to the whole invariant.
+
+The words don't read meaning, so two kinds of sentence fail that may not disclose anything. A word in another sense: "You're under the weight limit, booked at $2,350." A negation: "I can't share our ceiling, but I can do $2,350." Choose words that rarely share a sentence with the value for another reason, and read every violation whose detail says `next to "<word>"`.
+
+`never_disclose` matches values, not meaning. An agent that confirms a caller's guess ("Is your max $2,350?" "Yes, $2,350 is our max") or calls a logged counter-offer "our ceiling" passes it, unless `never_with` lists the word. A word it doesn't list, or the same meaning across two sentences ("That's above our maximum. The best I can do is $2,350."), still passes. A value in another form than the record's isn't matched either: a caller's ask in words ("twenty-three fifty") doesn't count as the caller saying it first, and a date of birth said as "March 12, 1985" doesn't match a stored `1985-03-12`.
+
+### Soft invariants
+
+Any invariant can be marked `soft: true`. It is checked exactly like a hard one, but breaking it never fails a trial and never changes pass^k. Instead, runs report how often it was broken:
+
+- per trial, under `soft` in `results.json`: each soft invariant that applied, whether it was broken, and the call or message that broke it;
+- per run, as a rate: the trials in which it was broken, out of the trials in which it applied. A rule applies in a trial when its tool was called, or for `never_disclose`, when the agent said anything.
+
+The terminal summary, the HTML report and the leaderboard show the rate, for example `counter-at-ceiling 37.5% (3 of 8 trials that called log_offer)`. Use a soft invariant for behaviour the policy allows but the customer wants measured. The freight example's `counter-at-ceiling` measures how often counter-offers reach the price ceiling, which the policy permits. Anything the policy forbids stays hard. A soft violation in a `reference` replay doesn't make `sandtable lint` call a task unsolvable.
+
+The `Soft rule` comments that `init --sop` writes are different: they note the SOP's rules that no invariant checks, such as wording, a rule that needs today's date, or one that depends on a fact no record holds, each with the reason ([init from an SOP](/guides/init#from-an-sop-claude-grounded)). Nothing checks them.
+
+Every invariant also accepts `review` and `source` (see [Review workflow](/concepts/review-workflow)).
+
+## personas and tasks
+
+```yaml
+personas:
+  - id: haggler
+    description: A seasoned owner-operator who always pushes on rate.
+
+tasks:
+  - id: walk-away-above-ceiling
+    description: Shown in reports.
+    persona: haggler
+    tags: [negotiation, refusal]
+    critical: true                     # optional: a release blocker, see below
+    max_turns: 12                      # overrides the domain default
+    user:
+      instructions: |                  # hidden goal + private facts; the agent never sees this
+        You need at least $1,600 and will not go lower...
+      opening: "MC 100101, calling about L-1002."   # optional fixed first line
+      script: [ ... ]                  # optional fixed turns for --user scripted
+    reference:                         # optional: what a correct agent would do; `sandtable lint` replays it
+      - { tool: verify_carrier, args: { mc_number: "100101" } }
+      - { tool: verify_carrier, args: { mc_number: "109999" }, expect_error: not found }   # a call the API must reject
+    given:                             # optional: this task's changes to the world it starts in
+      rows: { carriers: [{ mc_number: "100101", insurance_status: expired }] }
+      context: { caller_id: "+1-555-0148" }
+    expect:
+      state:
+        - { table: bookings, count: 0 }                                # exactly N rows (with optional where)
+        - { table: bookings, where: { load_id: L-1004 } }              # at least one matching row
+        - { table: loads, key: L-1002, fields: { status: available } } # this row matches
+        - { table: loads, key: L-9999, count: 0 }                      # this row does not exist
+      called: [verify_carrier]          # each must have succeeded at least once
+      not_called: [transfer_to_human]   # never attempted
+      reply_includes: ["confirmation"]  # some agent message contains it (case-insensitive, U+2010/U+2011 read as -); use sparingly
+```
+
+A `reference` call must succeed when `lint` replays it, unless it has `expect_error`: then the call must fail with a tool error, as a correct agent's lookup of an unknown MC number does in a refusal task. `expect_error: true` accepts any tool error, and text such as `expect_error: not found` requires an error that contains it, case-insensitive, so a domain edit that removes the check rejecting the call shows up in `lint`. A call with an unknown tool or arguments the tool rejects is a `lint` error either way. References only feed `lint`: they never grade a trial.
+
+`called` and `not_called` take a tool's name, or `{ tool, args }` to count only the calls whose arguments match `args`, a [where clause](#where-clauses) on the arguments as the tool accepted them, with defaults filled in and numbers coerced:
+
+```yaml
+called:
+  - verify_carrier                                                        # any successful call
+  - { tool: transfer_to_human, args: { reason: { $contains: billing } } }  # a handoff for the right reason
+not_called:
+  - { tool: book_load, args: { load_id: { $in: [L-1004, L-1005] } } }     # never attempted on these loads
+```
+
+- A `called` entry with `args` passes when a successful call matches. A `not_called` entry with `args` fails on any matching call, successful or not, as a plain name fails on any attempt. A call rejected for invalid arguments has no arguments to match, so only a plain name counts it.
+- Values are literal: there is no call to take a `"$arg"` reference from.
+- `validate` fails when an entry names a tool or argument the tool doesn't have, uses an unknown operator, or gives `$in` or `$nin` something other than a list. `args` needs at least one condition: to match any call, give the tool's name alone.
+- The check id lists the conditions in order, each value as JSON: `called:transfer_to_human(reason={"$contains":"billing"})`, `not_called:book_load(load_id="L-1004")`. When no successful call matches, the detail says how the closest one differs: `book_load succeeded 2x, never with matching arguments: load_id is "L-1002", expected "L-1001"`.
+
+The simulated user ends the conversation by emitting `###STOP###` when its goal is met, impossible, or it has been handed off. If that final message also has content ("Fine, book it. Bye."), the agent gets one last turn to act on it. Trials that hit `max_turns` are still graded on the end state.
+
+The scripted user (`--user scripted`) replays `user.script` line by line, then stops. A task without `script` falls back to `opening` alone; a task with neither cannot run with the scripted user.
+
+Tasks also accept `review` and `source`, like invariants.
+
+### Critical tasks
+
+`critical: true` marks a task as a release blocker, such as booking a carrier whose insurance expired or cancelling an appointment for a caller who failed identity checks. `sandtable run` exits 1 when any trial of a critical task fails, with or without `--fail-under` and whatever the score, and says which ones:
+
+```text
+✗ 1 critical task(s) did not pass every trial: expired-insurance 3/4
+```
+
+Reports list critical tasks first and mark them, and the terminal summary adds a line such as `critical 2 of 3 passed every trial`. In `results.json`, each critical task carries `"critical": true`.
+
+A critical refusal guards against the harmful action, not against doing nothing: the do-nothing `noop` agent passes it. Keep gating on the score with `--fail-under` too. A [skipped trial](/concepts/pass-k#skipped-trials), one that ended in an error before the agent broke a rule, is not a critical failure: the run already exits 1 because it is incomplete.
+
+### Per-task world and context
+
+`given` changes the world one task starts in, so a scenario such as "this carrier's insurance just expired" needs neither a copy of the domain nor a seed row that only one task uses.
+
+- `rows` maps a table to rows that are merged into its seed by the table's key, for this task only. A row whose key is seeded patches that row: the fields it lists replace the seeded ones, and the others stay. A row with a new key is added. Every row needs the table's key, and `validate` fails on an unknown table, a missing key or a key given twice. Other tasks, and every trial's fresh copy, keep the plain seed.
+- `context` is what the system that connected the conversation already knows, such as a caller ID, an account number or a trigger payload. The agent is given it and the simulated user is not: the default system prompt states it as JSON after the policy, an agent over [HTTP](/reference/http-protocol) receives it as `context` in every request, and a [JS or TS module agent](/guides/bring-your-agent#your-agent-as-a-js-or-ts-module) as `context` in `createSession`. A value it states counts as shown to the agent for `never_disclose`.
+
+```yaml
+  - id: expired-insurance-callback
+    given:
+      rows:
+        carriers:
+          - { mc_number: "100101", insurance_status: expired }   # patches the seeded carrier
+      context: { caller_id: "+1-555-0148", line: after-hours }
+```
+
+`lint` checks the task against its patched seed and replays its `reference` there. `regrade` replays stored trials against it too. Editing a task's `context` changes what its agent was given, so `regrade` refuses runs made before the edit; editing its `rows` doesn't, and a call that now returns something else stops the regrade.
+
+## Related
+
+<Columns cols={2}>
+  <Card title="Write tasks that discriminate" icon="bullseye" href="/guides/write-tasks">
+    Hidden goals, end states and the lint rules that keep a suite honest.
+  </Card>
+  <Card title="HTTP agent protocol" icon="plug" href="/reference/http-protocol">
+    The request and response shapes for agents that run as a service.
+  </Card>
+  <Card title="results.json" icon="file-code" href="/reference/results-schema">
+    What a run writes, field by field.
+  </Card>
+  <Card title="CLI" icon="terminal" href="/reference/cli">
+    `validate`, `lint`, `review`, `run` and the rest.
+  </Card>
+</Columns>

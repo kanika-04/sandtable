@@ -1,0 +1,49 @@
+---
+title: "sandtable vs IntellAgent: a reviewed suite or generated tests"
+sidebarTitle: "IntellAgent"
+description: "IntellAgent generates many scenarios from a prompt or policy and a model critiques them; sandtable grades a reviewed suite deterministically. When to use each."
+keywords: ["IntellAgent", "Plurai", "generated scenarios", "policy graph", "LLM critique", "test coverage"]
+---
+
+**[IntellAgent](https://github.com/plurai-ai/intellagent)** (Plurai, [Apache-2.0](https://github.com/plurai-ai/intellagent/blob/main/LICENSE), [paper](https://arxiv.org/abs/2501.11067)) generates test scenarios for a conversational agent automatically. It takes the agent's system prompt or a document of the company's policies, plus the agent's tools and a database schema ([how it works](https://intellagent-doc.plurai.ai/How_it_Works/how-it-works/)). It breaks the policies into a policy graph and generates events that combine several policies at a chosen complexity level, each with a user request and initial database rows. It then simulates the user, and an LLM critique reviews each conversation to find the policies the agent broke.
+
+**sandtable** drafts a domain from the customer's artifacts (API spec, SOP, call transcripts), has a person review it, and keeps it in the repo. It grades deterministically on the world's end state and on invariants checked before every tool call.
+
+## The key difference: generated coverage or a reviewed suite
+
+IntellAgent is built to explore. Its README describes generating "thousands of edge-case scenarios", and it reports success rates by policy category and by complexity level. Its paper generated 1,000 events per domain and found that model results on them closely track τ-bench's (Pearson correlation 0.98 for airline and 0.92 for retail). The same section shows it testing policies that a final database cannot show, such as asking for the user's consent ([paper](https://arxiv.org/abs/2501.11067), section 4.2).
+
+sandtable is built to gate. The suite is fixed and reviewed, and each rule traces back to its source. `init --sop` makes every drafted invariant quote the SOP sentence it comes from, warns when the quote is not found verbatim, and leaves it `review: pending` until someone accepts it. Each trial then passes or fails on checks anyone can re-run, so a score change means the agent changed, not the test.
+
+What you feed IntellAgent matters. Given the agent's system prompt, it tests the policies the prompt states; given the customer's policy document, it tests the customer's rules.
+
+## Side by side
+
+| | sandtable | IntellAgent |
+|---|---|---|
+| Source of test cases | the customer's API, SOP and transcripts, drafted by `init` and reviewed by a person | generated from the system prompt or a policy document, the tools and a database schema |
+| Stateful world | declarative tables in the repo, fresh copy per trial | generated initial database rows for each scenario |
+| Pass/fail | end state, invariants, required and forbidden tools; no judge | the simulated user ends the dialog with success or failure, and an LLM critique checks that verdict and lists the policies broken ([paper](https://arxiv.org/abs/2501.11067), sections 3.2 and 3.3) |
+| Rules on every tool call | checked before each call runs | judged from the dialog by the critique |
+| Repeated trials and pass^k | yes | not built in; it reports success rates by policy category and complexity level |
+| Results | terminal summary, `results.json`, HTML report with failure clusters | a Streamlit dashboard with per-policy and per-complexity analysis |
+| Agent integration | HTTP, JS/TS module, Claude, models on Amazon Bedrock, OpenAI-compatible endpoints | a built-in LangChain tool-calling agent configured from your prompt, tools and database, or your own LangGraph agent ([custom chatbot](https://intellagent-doc.plurai.ai/customization/custom_chatbot/)) |
+
+## Choose IntellAgent when
+
+- You want broad, automatically generated coverage quickly, to explore how an agent behaves across many combinations of policies.
+- You want results broken down by policy category and by how hard the scenario is.
+- Some policies you care about leave no trace in the database, such as asking for consent, and a model's critique is an acceptable verdict for them.
+- Your agent is built on LangGraph, or a LangChain tool-calling agent fits.
+
+## Choose sandtable when
+
+- The customer's documents define what is allowed, and each rule must trace back to a sentence in them.
+- Pass/fail has to be reproducible and explainable to the customer: "it booked carrier 100202, whose insurance was expired".
+- The suite must be stable across runs, so that a score change means the agent changed.
+
+## Use both
+
+Use generated scenarios to explore, then turn the failures that matter into sandtable tasks, so they are graded deterministically and run on every change.
+
+Last reviewed October 2026. Something out of date or unfair? [Open an issue](https://github.com/sandtable-ai/sandtable/issues).

@@ -1,0 +1,109 @@
+---
+title: "Write tasks that separate good agents from careless ones"
+sidebarTitle: "Write tasks that discriminate"
+description: "Write tasks that a correct agent passes and a careless one fails: firm hidden goals, outcomes graded on state, balanced refusals and a reference solution."
+keywords: ["test case design", "tasks.yaml", "hidden goals", "reference calls", "refusals", "personas"]
+---
+
+A task discriminates when a correct agent passes it and a careless or do-nothing agent fails it. Most weak suites fail that test in one of two ways: tasks that a do-nothing agent passes, and tasks that a correct agent fails because the task, not the agent, is wrong. These practices avoid both.
+
+## Anatomy of a good task
+
+```yaml
+- id: negotiate-within-ceiling
+  description: Carrier haggles; the agent closes between the caller's floor and the max rate.
+  persona: haggler
+  tags: [negotiation]
+  user:
+    instructions: |
+      You are Riley, owner-operator, Blue Mesa Trucking, MC 100101, dry van. You want load L-1001 (Dallas to Atlanta).
+      Open by asking for $2,600. You will accept any offer of $2,250 or more, but never less than $2,250.
+      If the agent won't reach $2,250, say no thanks and end the call.
+    script:
+      - MC 100101, Blue Mesa. I'm looking at L-1001.
+      - I need $2,600 for that one.
+      - Okay, how about $2,300?
+      - Deal, book it at 2300.
+      - Thanks!
+  reference:
+    - { tool: verify_carrier, args: { mc_number: "100101" } }
+    - { tool: get_load, args: { load_id: L-1001 } }
+    - { tool: book_load, args: { load_id: L-1001, mc_number: "100101", rate: 2300 } }
+  expect:
+    state:
+      - { table: bookings, where: { load_id: L-1001, mc_number: "100101", rate: { $gte: 2250, $lte: 2350 } }, count: 1 }
+```
+
+It has a firm hidden goal with numbers, a clear exit, a script for offline runs, a reference that proves it can be passed, and an expectation on state that accepts every correct outcome (any rate between the caller's floor and the ceiling) and nothing else.
+
+## Practices
+
+<Steps>
+  <Step title="Grade the outcome on state">
+    Expect the records the conversation should create or change: a booking with these fields, a row whose status changed, an escalation created. State is what the customer's systems will actually hold. Use `reply_includes` sparingly: wording varies between runs and models.
+  </Step>
+  <Step title="Accept every correct outcome">
+    Use ranges and operators instead of one exact value when the policy allows several: `rate: { $gte: 2250, $lte: 2350 }`. Do not forbid acceptable alternatives. In the first live runs, a task that forbade any handoff failed agents that handed off correctly *after* a valid booking; it was relaxed to grade the booking itself.
+  </Step>
+  <Step title="Assert what must not change">
+    For refusal tasks, check that nothing happened where it matters: `{ table: bookings, count: 0 }`, or `{ table: loads, key: L-1002, fields: { status: available } }`.
+  </Step>
+  <Step title="Make refusals cost something">
+    A refusal graded only on "nothing changed" is passed by an agent that never does anything. Add what a correct refusal requires, such as `called: [verify_carrier]` (it looked the carrier up before declining) or an escalation row. To require the lookup of this caller's carrier, give the entry arguments: `called: [{ tool: verify_carrier, args: { mc_number: "100202" } }]`. Then the [noop baseline](/concepts/baselines) fails it.
+  </Step>
+  <Step title="Balance write and no-write tasks">
+    Include tasks that must end with a write and tasks that must end without one. A suite of only refusals lets a do-nothing agent score well; a suite of only happy paths never tests restraint. Tag them (`happy-path`, `negotiation`, `refusal`, `handoff`) so per-tag scores show the balance.
+  </Step>
+  <Step title="Mark the release blockers critical">
+    Some failures stop a launch whatever the overall score: booking a carrier whose insurance expired, acting for a caller who failed identity checks, booking an appointment for chest pain instead of sending the caller to 911. Mark those tasks `critical: true`, and `sandtable run` exits 1 when any of their trials fails, with or without `--fail-under`. Keep the list short, so a red critical task always means stop. See [critical tasks](/reference/spec#critical-tasks).
+  </Step>
+  <Step title="Change only what the scenario changes">
+    When a scenario needs a slightly different world, such as a carrier whose insurance lapsed this morning, patch it in the task with `given.rows` instead of adding a seed row that only this task uses, or copying the domain. Pair it with a success task on the unpatched row, so the two show the agent tells them apart. Put what the phone system or trigger already knows, such as the caller ID, in `given.context`. See [per-task world and context](/reference/spec#per-task-world-and-context).
+  </Step>
+  <Step title="Give the caller a firm, specific goal">
+    Write `user.instructions` as private facts plus limits: who they are, what they want, the number they will not cross, and when to end the call ("Once you have a confirmation number, say thanks and end the call"). Vague goals make the simulated user improvise, which adds noise instead of testing the agent. Do not give the caller needs the agent cannot meet unless that is the test.
+  </Step>
+  <Step title="Follow the policy, not the transcript">
+    When a task comes from a real call, the expected outcome is what the SOP requires, even if the human rep did something else. That is how `init` drafts tasks from transcripts, and how you should review them.
+  </Step>
+  <Step title="Prove it is solvable">
+    Add a `reference`: the tool calls a correct agent would make. `sandtable lint` replays it against a fresh world and checks that it passes every expectation without breaking an invariant. A task no agent could pass is a broken task. In a refusal task, the correct agent's call is often one the API rejects, such as a lookup of an unknown MC number: mark it `expect_error: true`, or `expect_error: not found` to name the error, and `lint` requires it to fail.
+  </Step>
+  <Step title="Make it run offline">
+    Add a `user.script` so the task runs with `--user scripted`, for smoke tests in CI and for debugging graders without model calls.
+  </Step>
+</Steps>
+
+## Make hard tasks hard for the right reasons
+
+When capable models pass every task, the suite stops telling them apart. Raise the difficulty the way real calls do, not with traps:
+
+- **More to get right in one call.** Two loads, a booking and a callback, or a rep-confirm load next to an instant one. Grade each outcome, such as each booking, the callback's load ID, and the round numbering on each load.
+- **Details that change mid-call.** A corrected MC number, a new pickup date after an offer, a corrected empty date. Grade the version the caller gave last.
+- **Callers who test the rules.** Another company's MC, a load another company will haul, a question about another load's ceiling.
+
+Write every rule such a task needs into the policy in plain words first, and ask whether two people who know the domain would give the same pass or fail. The freight example's [hard tier](https://github.com/sandtable-ai/sandtable/tree/main/examples/freight#the-hard-tier) shows each task next to the policy rule it tests.
+
+## Use personas for behaviour, not goals
+
+A persona changes *how* the caller behaves: impatient, evasive, friendly, pushy on price. The task's instructions hold *what* they want. Reusing a few personas across many tasks shows whether an agent holds the policy under pressure, not just in polite conversations.
+
+## Check your suite
+
+```bash
+npx sandtable-ai validate ./my-domain                          # schema and cross-references
+npx sandtable-ai lint ./my-domain                              # ready, solvable, non-vacuous, graded
+npx sandtable-ai run ./my-domain --agent noop --user scripted  # the floor
+```
+
+Then run the real agent, open the report, and read the failing trajectories. For each failure, decide whether the agent, the task or the simulated caller was wrong, and fix the right one. A suite earns trust one corrected task at a time.
+
+## Checklist
+
+- [ ] Every task has `state` or `called` expectations, and lint reports it ready.
+- [ ] Every task that expects a write has a `reference`, and lint reports it solvable.
+- [ ] Refusal tasks require an action, so the noop baseline fails them.
+- [ ] Expectations accept every outcome the policy allows.
+- [ ] Hidden goals state limits and an exit.
+- [ ] Every task has a `user.script`.
+- [ ] Names, numbers and records are fictional.

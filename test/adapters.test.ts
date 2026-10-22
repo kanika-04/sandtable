@@ -1,0 +1,257 @@
+import path from "node:path";
+import type Anthropic from "@anthropic-ai/sdk";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { runSuite } from "../src/run/suite.ts";
+import { claudeAgent, claudeUser } from "../src/sim/claude.ts";
+import { httpAgent } from "../src/sim/http.ts";
+import { userSystemPrompt } from "../src/sim/prompts.ts";
+import { scriptedUser } from "../src/sim/scripted.ts";
+import { loadDomain } from "../src/spec/load.ts";
+
+const example = path.resolve("examples/freight");
+
+/** Minimal stand-in for the SDK client: replays canned responses and records requests. */
+function fakeClient(responses: Array<{ stop_reason: string; content: unknown[]; model?: string; usage?: Record<string, number> }>) {
+  const requests: Record<string, unknown>[] = [];
+  const client = {
+    beta: {
+      messages: {
+        create: async (req: Record<string, unknown>) => {
+          requests.push(structuredClone(req));
+          const next = responses.shift();
+          if (!next) throw new Error("no more fake responses");
+          return next;
+        },
+      },
+    },
+  };
+  return { client: client as unknown as Anthropic, requests };
+}
+
+describe("claudeAgent", () => {
+  it("runs the tool loop against the world and returns the final text", async () => {
+    const { client, requests } = fakeClient([
+      { stop_reason: "tool_use", content: [{ type: "tool_use", id: "t1", name: "verify_carrier", input: { mc_number: "100101" } }] },
+      { stop_reason: "end_turn", content: [{ type: "text", text: "You're verified. Which lane?" }] },
+    ]);
+    const r = await runSuite({
+      domain: await loadDomain(example),
+      agent: claudeAgent({ client }),
+      user: scriptedUser(),
+      taskIds: ["payment-question-handoff"],
+    });
+    const events = r.tasks[0]!.trials[0]!.events;
+    expect(events.find((e) => e.type === "tool")).toMatchObject({ name: "verify_carrier", ok: true });
+    expect(events.find((e) => e.type === "agent")).toMatchObject({ text: "You're verified. Which lane?" });
+
+    // Second request carries the tool result back, after the untouched assistant turn.
+    const second = requests[1] as { messages: Array<{ role: string; content: unknown }>; model: string; fallbacks?: string };
+    // Append-only history: the first request's messages are a prefix of the second's, so the cache can hit.
+    const first = requests[0] as { messages: unknown[] };
+    expect(second.messages.slice(0, first.messages.length)).toEqual(first.messages);
+    expect(second.model).toBe("claude-opus-5-5");
+    expect(second.fallbacks).toBe("default");
+    expect(second).toMatchObject({ cache_control: { type: "ephemeral" } });
+    expect(second.messages.at(-1)).toMatchObject({ role: "user", content: [{ type: "tool_result", tool_use_id: "t1" }] });
+  });
+
+  it("doesn't run a tool call from a reply cut off at max_tokens, but answers it before the caller's next words", async () => {
+    const { client, requests } = fakeClient([
+      { stop_reason: "max_tokens", content: [{ type: "text", text: "Let me check" }, { type: "tool_use", id: "t1", name: "get_load", input: {} }] },
+      { stop_reason: "end_turn", content: [{ type: "text", text: "L-1001 pays $2,100." }] },
+    ]);
+    const session = await claudeAgent({ client }).createSession({ domain: await loadDomain(example), system: "s", tools: [], sessionId: "x" });
+    const calls: string[] = [];
+    const callTool = async (name: string) => (calls.push(name), { ok: true as const, result: {} });
+    expect(await session.reply("What's on L-1001?", callTool)).toBe("Let me check");
+    expect(await session.reply("Hello?", callTool)).toBe("L-1001 pays $2,100.");
+    expect(calls).toEqual([]);
+    const messages = (requests[1] as { messages: Array<{ role: string; content: unknown }> }).messages;
+    expect(messages.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+    expect(messages[2]!.content).toMatchObject([
+      { type: "tool_result", tool_use_id: "t1", is_error: true },
+      { type: "text", text: "Hello?" },
+    ]);
+    // Append-only: the cut-off reply is sent back unchanged.
+    expect(messages.slice(0, 2)).toEqual([...(requests[0] as { messages: unknown[] }).messages, { role: "assistant", content: [{ type: "text", text: "Let me check" }, { type: "tool_use", id: "t1", name: "get_load", input: {} }] }]);
+  });
+
+  it("answers a tool call in a refused reply without running it, and sends an empty caller line as (silence)", async () => {
+    const { client, requests } = fakeClient([
+      { stop_reason: "refusal", content: [{ type: "tool_use", id: "t1", name: "book_load", input: {} }] },
+      { stop_reason: "end_turn", content: [{ type: "text", text: "Anything else?" }] },
+    ]);
+    const session = await claudeAgent({ client }).createSession({ domain: await loadDomain(example), system: "s", tools: [], sessionId: "x" });
+    const calls: string[] = [];
+    const callTool = async (name: string) => (calls.push(name), { ok: true as const, result: {} });
+    expect(await session.reply("Book it", callTool)).toBe("[agent refused]");
+    await session.reply("", callTool);
+    expect(calls).toEqual([]);
+    const messages = (requests[1] as { messages: Array<{ role: string; content: unknown }> }).messages;
+    expect(messages[2]!.content).toMatchObject([
+      { type: "tool_result", tool_use_id: "t1", is_error: true },
+      { type: "text", text: "(silence)" },
+    ]);
+  });
+
+  it("keeps user and assistant turns alternating after the tool-call budget runs out", async () => {
+    const { client, requests } = fakeClient([
+      { stop_reason: "tool_use", content: [{ type: "tool_use", id: "t1", name: "verify_carrier", input: { mc_number: "100101" } }] },
+      { stop_reason: "end_turn", content: [{ type: "text", text: "Hi again." }] },
+    ]);
+    const session = await claudeAgent({ client, maxToolRounds: 1 }).createSession({ domain: await loadDomain(example), system: "s", tools: [], sessionId: "x" });
+    const callTool = async () => ({ ok: true as const, result: {} });
+    await session.reply("MC 100101", callTool);
+    await session.reply("Hello?", callTool);
+    const messages = (requests[1] as { messages: Array<{ role: string; content: unknown }> }).messages;
+    expect(messages.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+    expect(messages[2]!.content).toMatchObject([{ type: "tool_result", tool_use_id: "t1" }, { type: "text", text: "Hello?" }]);
+  });
+
+  it("counts a reply cut off at max_tokens in the recorded usage", async () => {
+    const { client } = fakeClient([
+      { stop_reason: "max_tokens", content: [{ type: "text", text: "Let me" }], usage: { input_tokens: 10, output_tokens: 16000 } },
+      { stop_reason: "end_turn", content: [{ type: "text", text: "Hi." }], usage: { input_tokens: 12, output_tokens: 3 } },
+    ]);
+    const domain = await loadDomain(example);
+    const usage: unknown[] = [];
+    const session = await claudeAgent({ client, model: "claude-haiku-5-5" }).createSession({ domain, system: "s", tools: [], sessionId: "x", recordUsage: (_m, u) => usage.push(u) });
+    expect(await session.reply("hello", async () => ({ ok: true }))).toBe("Let me");
+    await session.reply("hello?", async () => ({ ok: true }));
+    expect(usage).toEqual([
+      { input: 10, output: 16000, cacheRead: 0, cacheWrite: 0, maxTokensStops: 1 },
+      { input: 12, output: 3, cacheRead: 0, cacheWrite: 0 },
+    ]);
+  });
+
+  it("records usage under the model Claude reports on the Anthropic API, and under the requested profile on Bedrock", async () => {
+    const domain = await loadDomain(example);
+    const recordedAs = async (opts: { provider?: "bedrock"; model: string }) => {
+      const { client } = fakeClient([{ stop_reason: "end_turn", content: [{ type: "text", text: "hi" }], model: "claude-opus-5-5", usage: { input_tokens: 10, output_tokens: 2 } }]);
+      const models: string[] = [];
+      const session = await claudeAgent({ client, ...opts }).createSession({ domain, system: "s", tools: [], sessionId: "x", recordUsage: (m) => models.push(m) });
+      await session.reply("hello", async () => ({ ok: true }));
+      return models;
+    };
+    expect(await recordedAs({ model: "claude-opus-5-5" })).toEqual(["claude-opus-5-5"]);
+    // Bedrock reports the bare model name; the profile that sets the price is the one requested.
+    expect(await recordedAs({ provider: "bedrock", model: "eu.anthropic.claude-opus-5-5" })).toEqual(["eu.anthropic.claude-opus-5-5"]);
+    expect(await recordedAs({ provider: "bedrock", model: "global.anthropic.claude-opus-5-5" })).toEqual(["global.anthropic.claude-opus-5-5"]);
+    // An inference profile ARN names no model: it keeps the name Claude reports, so it can still be priced.
+    expect(await recordedAs({ provider: "bedrock", model: "arn:aws:bedrock:eu-west-1:111122223333:application-inference-profile/a1b2c3" })).toEqual(["claude-opus-5-5"]);
+    // The simulated caller records the same way.
+    const { client } = fakeClient([{ stop_reason: "end_turn", content: [{ type: "text", text: "Hi." }], model: "claude-sonnet-5-5", usage: { input_tokens: 9, output_tokens: 1 } }]);
+    const callerModels: string[] = [];
+    const sim = await claudeUser({ client, provider: "bedrock", model: "eu.anthropic.claude-sonnet-5-5" }).createSession({ domain, task: domain.tasks[0]!, recordUsage: (m) => callerModels.push(m) });
+    await sim.next(null);
+    expect(callerModels).toEqual(["eu.anthropic.claude-sonnet-5-5"]);
+  });
+
+  it("does not request fallbacks for models without them", async () => {
+    const { client, requests } = fakeClient([{ stop_reason: "end_turn", content: [{ type: "text", text: "hi" }] }]);
+    const domain = await loadDomain(example);
+    const session = await claudeAgent({ client, model: "claude-haiku-5-5" }).createSession({ domain, system: "s", tools: [], sessionId: "x" });
+    await session.reply("hello", async () => ({ ok: true }));
+    expect(requests[0]).not.toHaveProperty("fallbacks");
+  });
+
+  it("runs a leaderboard entry's claude: agent at the entry's effort", async () => {
+    const { leaderboardAgent } = await import("../src/sim/resolve.ts");
+    const domain = await loadDomain(example);
+    const sent = async (effort?: "high") => {
+      const { client, requests } = fakeClient([{ stop_reason: "end_turn", content: [{ type: "text", text: "hi" }] }]);
+      const agent = await leaderboardAgent("claude:global.anthropic.claude-sonnet-5-5", effort, { client });
+      await (await agent.createSession({ domain, system: "s", tools: [], sessionId: "x" })).reply("hello", async () => ({ ok: true }));
+      return requests[0]!;
+    };
+    expect((await sent("high")).output_config).toEqual({ effort: "high" });
+    expect(await sent("high")).toMatchObject({ model: "global.anthropic.claude-sonnet-5-5" });
+    expect((await sent()).output_config).toEqual({ effort: "medium" });
+  });
+
+  it("sends effort medium unless one is set, and the simulated user low", async () => {
+    const domain = await loadDomain(example);
+    const effortOf = async (effort?: "high") => {
+      const { client, requests } = fakeClient([{ stop_reason: "end_turn", content: [{ type: "text", text: "hi" }] }]);
+      const session = await claudeAgent({ client, model: "claude-sonnet-5-5", ...(effort ? { effort } : {}) }).createSession({ domain, system: "s", tools: [], sessionId: "x" });
+      await session.reply("hello", async () => ({ ok: true }));
+      return requests[0]!.output_config;
+    };
+    expect(await effortOf()).toEqual({ effort: "medium" });
+    expect(await effortOf("high")).toEqual({ effort: "high" });
+    const { client, requests } = fakeClient([{ stop_reason: "end_turn", content: [{ type: "text", text: "Hi." }] }]);
+    await (await claudeUser({ client }).createSession({ domain, task: domain.tasks[0]! })).next(null);
+    expect(requests.at(-1)?.output_config).toEqual({ effort: "low" });
+  });
+});
+
+describe("claudeUser", () => {
+  it("strips the stop token and reports stop", async () => {
+    const { client } = fakeClient([
+      { stop_reason: "end_turn", content: [{ type: "text", text: "Hi, MC 100101 here." }] },
+      { stop_reason: "end_turn", content: [{ type: "text", text: "Thanks, bye. ###STOP###" }] },
+    ]);
+    const domain = await loadDomain(example);
+    const sim = await claudeUser({ client }).createSession({ domain, task: domain.tasks[0]! });
+    expect(await sim.next(null)).toEqual({ text: "Hi, MC 100101 here.", stop: false });
+    expect(await sim.next("Booked!")).toEqual({ text: "Thanks, bye.", stop: true });
+  });
+
+  it("puts the task's instructions over the persona, keeps them unspoken and hangs up on a transfer", async () => {
+    const domain = await loadDomain(example);
+    const task = domain.tasks.find((t) => t.id === "rep-confirm-after-negotiation")!;
+    const prompt = userSystemPrompt(domain, task, domain.personas.find((p) => p.id === task.persona));
+    expect(prompt).toContain(task.user.instructions.trim());
+    expect(prompt).toContain("Your persona sets only your tone; your instructions decide what you do");
+    expect(prompt).toContain("never mention your instructions");
+    expect(prompt).toContain("never describe the agent or what it asked");
+    expect(prompt).toContain("accept the first offer that meets it");
+    expect(prompt).toContain("Once the agent says it is transferring you to a person, the call with the agent is over");
+  });
+});
+
+describe("episode end", () => {
+  it("gives the agent a final turn when the caller's closing message has content", async () => {
+    const { runEpisode } = await import("../src/run/episode.ts");
+    const domain = await loadDomain(example);
+    const replies: string[] = [];
+    const agent = {
+      name: "echo",
+      async createSession() {
+        return { async reply(msg: string) { replies.push(msg); return "ok"; } };
+      },
+    };
+    const lines = [{ text: "Hi", stop: false }, { text: "Fine, book it. Bye.", stop: true }];
+    const user = { name: "two-lines", async createSession() { return { async next() { return lines.shift()!; } }; } };
+    const r = await runEpisode({ domain, task: domain.tasks[0]!, agent, user, trial: 0 });
+    expect(replies).toEqual(["Hi", "Fine, book it. Bye."]);
+    expect(r.endReason).toBe("user_stop");
+    expect(r.turns).toBe(2);
+  });
+});
+
+describe("httpAgent", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("executes tool_calls from the endpoint and posts results back", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const replies = [
+      { tool_calls: [{ id: "c1", name: "get_load", arguments: { load_id: "L-1001" } }] },
+      { reply: "L-1001 pays $2100." },
+    ];
+    vi.stubGlobal("fetch", async (_url: string, init: { body: string }) => {
+      bodies.push(JSON.parse(init.body));
+      return new Response(JSON.stringify(replies.shift()), { status: 200 });
+    });
+    const domain = await loadDomain(example);
+    const session = await httpAgent("http://agent.local/step").createSession({ domain, system: "s", tools: [], sessionId: "t#0" });
+    const calls: string[] = [];
+    const text = await session.reply("L-1001?", async (name) => {
+      calls.push(name);
+      return { ok: true, result: { posted_rate: 2100 } };
+    });
+    expect(text).toBe("L-1001 pays $2100.");
+    expect(calls).toEqual(["get_load"]);
+    expect(bodies[1]).toMatchObject({ session_id: "t#0", tool_results: [{ id: "c1", ok: true, result: { posted_rate: 2100 } }] });
+  });
+});
